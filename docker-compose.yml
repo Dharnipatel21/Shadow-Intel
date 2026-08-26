@@ -1,0 +1,10 @@
+services:
+  backend:
+    build: ./backend
+    ports: ["8010:8000"]
+  frontend:
+    build: ./frontend
+    ports: ["3000:3000"]
+    environment:
+      NEXT_PUBLIC_API_URL: http://127.0.0.1:8010
+    depends_on: [backend]
