@@ -1,12 +1,12 @@
 'use client';
 
 import Link from 'next/link';
-import { FormEvent, useState, useEffect } from 'react';
+import { FormEvent, Suspense, useState, useEffect } from 'react';
 import { useRouter, useSearchParams } from 'next/navigation';
 
 const API = process.env.NEXT_PUBLIC_API_URL ?? '';
 
-export default function VerifyPage() {
+function VerifyForm() {
   const router = useRouter();
   const params = useSearchParams();
   const [email, setEmail] = useState('');
@@ -39,4 +39,8 @@ export default function VerifyPage() {
   }
 
   return <main className="auth-shell"><div className="auth-wrap"><div className="brand auth-brand"><span className="mark">SHADOW<span>INTEL</span></span><small>INVESTIGATION WORKSPACE</small></div><section className="card auth-card"><p className="eyebrow">EMAIL VERIFICATION</p><h1>Enter your code</h1><p>We sent a 6-digit verification code to {email || 'your email'}.</p><form className="auth-form" onSubmit={verify}><label>Email<input type="email" value={email} onChange={(event) => setEmail(event.target.value)} autoComplete="email" required /></label><label>Verification code<input value={code} onChange={(event) => setCode(event.target.value)} maxLength={6} inputMode="numeric" autoComplete="one-time-code" required /></label>{error && <p className="notice auth-error" role="alert">{error}</p>}{notice && <p className="notice">{notice}</p>}<button type="submit" disabled={busy}>{busy ? 'Verifying…' : 'Verify account'}</button></form><button className="auth-google" type="button" onClick={resend} disabled={resending}>{resending ? 'Resending…' : 'Resend code'}</button><p className="auth-link">Wrong email? <Link href="/signup">Start over</Link></p></section><p className="disclaimer auth-disclaimer">ShadowIntel assists investigation and evidence analysis. It does not determine guilt, criminality, or legal responsibility.</p></div></main>;
+}
+
+export default function VerifyPage() {
+  return <Suspense fallback={<main className="auth-shell"><div className="loading">Loading verification…</div></main>}><VerifyForm /></Suspense>;
 }

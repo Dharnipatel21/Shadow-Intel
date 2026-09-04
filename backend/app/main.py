@@ -4,7 +4,7 @@ from time import perf_counter
 import hashlib, json, re, shutil
 from urllib.parse import parse_qs, urlparse
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Query, Request
-from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from . import store, auth, config, llm, export, data
@@ -376,6 +376,15 @@ def evidence_detail(evidence_id:str):
     x=store.one('SELECT * FROM evidence WHERE id=?',evidence_id)
     if not x: raise HTTPException(404,'Evidence not found')
     return x
+
+@app.get('/api/evidence/{evidence_id}/file')
+def evidence_file(evidence_id: str):
+    """Serve the original locally stored evidence file for supported workspace previews."""
+    item = evidence_detail(evidence_id)
+    source = Path(item['path'])
+    if not source.is_file():
+        raise HTTPException(404, 'Stored evidence file not found')
+    return FileResponse(source, filename=source.name)
 @app.post('/api/evidence/{evidence_id}/verify')
 @app.get('/api/evidence/{evidence_id}/verify')
 def verify(evidence_id:str):

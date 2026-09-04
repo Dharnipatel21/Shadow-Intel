@@ -44,6 +44,15 @@ def init(force=False):
     CREATE TABLE IF NOT EXISTS events(id TEXT PRIMARY KEY,type TEXT,timestamp TEXT,title TEXT,entities TEXT,amount REAL,source TEXT,confidence REAL);
     CREATE TABLE IF NOT EXISTS jobs(id TEXT PRIMARY KEY,source TEXT,status TEXT,created_at TEXT,result TEXT,case_id TEXT);
     CREATE TABLE IF NOT EXISTS reports(id TEXT PRIMARY KEY,created_at TEXT,content TEXT);
+    CREATE TABLE IF NOT EXISTS blackboard_items(
+        id TEXT PRIMARY KEY,case_id TEXT NOT NULL,kind TEXT NOT NULL,ref_id TEXT,title TEXT NOT NULL,
+        content TEXT,status TEXT,x REAL NOT NULL,y REAL NOT NULL,color TEXT,created_by TEXT,
+        created_at TEXT NOT NULL,updated_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS blackboard_connections(
+        id TEXT PRIMARY KEY,case_id TEXT NOT NULL,from_id TEXT NOT NULL,to_id TEXT NOT NULL,
+        label TEXT,created_at TEXT NOT NULL
+    );
     ''')
     _migrate_cases_table(c)
     for table in ('evidence', 'jobs'):
@@ -273,6 +282,21 @@ def detect_anomalies(case_id=None):
         if len(people)>1: out.append({"id":'AN-L-'+day+loc,"type":"Location overlap","severity":"MEDIUM","confidence":.8,"timestamp":items[0]['timestamp'],"entities":people+[loc],"explanation":f"{len(people)} entities have observed activity at {loc} on {day}.","evidence":list(dict.fromkeys(x['source'] for x in items))})
     risk_graph, analytics=graph()
     return enrich_anomalies(out[:30], risk_graph, analytics)
+def _ensure_blackboard_schema():
+    """Keep the optional case-board migration safe for databases created before it existed."""
+    c=conn()
+    c.executescript('''
+    CREATE TABLE IF NOT EXISTS blackboard_items(
+        id TEXT PRIMARY KEY,case_id TEXT NOT NULL,kind TEXT NOT NULL,ref_id TEXT,title TEXT NOT NULL,
+        content TEXT,status TEXT,x REAL NOT NULL,y REAL NOT NULL,color TEXT,created_by TEXT,
+        created_at TEXT NOT NULL,updated_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS blackboard_connections(
+        id TEXT PRIMARY KEY,case_id TEXT NOT NULL,from_id TEXT NOT NULL,to_id TEXT NOT NULL,
+        label TEXT,created_at TEXT NOT NULL
+    );
+    ''')
+    c.commit(); c.close()
 def retrieve(question, case_id=CASE['id']):
     tokens={x.lower() for x in re.findall(r'[a-zA-Z0-9-]{3,}',question)}
     evidence=query('SELECT * FROM evidence WHERE case_id=?', case_id)
@@ -283,6 +307,7 @@ def retrieve(question, case_id=CASE['id']):
     return [e for _,e in sorted(scored,key=lambda x:x[0],reverse=True)[:6]]
 def list_blackboard(case_id):
     """Live corkboard for a case: pinned entities/evidence, notes, and hypotheses plus the strings connecting them."""
+    _ensure_blackboard_schema()
     items=query('SELECT * FROM blackboard_items WHERE case_id=? ORDER BY created_at', case_id)
     connections=query('SELECT * FROM blackboard_connections WHERE case_id=? ORDER BY created_at', case_id)
     return {'items':items,'connections':connections}
