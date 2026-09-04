@@ -27,19 +27,34 @@ def _loads(row, fields=('aliases','entities','audit')):
     for f in fields:
         if f in d and d[f]: d[f]=json.loads(d[f])
     return d
+CASE_COLUMNS = ('id','name','status','investigator','priority','stage','disclaimer','created_at','updated_at')
+def _migrate_cases_table(c):
+    """Add case-management columns to an already-existing cases table without losing data."""
+    existing={row[1] for row in c.execute('PRAGMA table_info(cases)').fetchall()}
+    additions={'investigator':"TEXT DEFAULT ''",'priority':"TEXT DEFAULT 'MEDIUM'",'stage':"TEXT DEFAULT 'EVIDENCE_INGESTION'",'created_at':"TEXT DEFAULT ''",'updated_at':"TEXT DEFAULT ''"}
+    for column,ddl in additions.items():
+        if column not in existing: c.execute(f'ALTER TABLE cases ADD COLUMN {column} {ddl}')
 def init(force=False):
     if force and DB.exists(): DB.unlink()
     c=conn(); c.executescript('''
     CREATE TABLE IF NOT EXISTS cases(id TEXT PRIMARY KEY,name TEXT,status TEXT,disclaimer TEXT);
     CREATE TABLE IF NOT EXISTS entities(id TEXT PRIMARY KEY,label TEXT,type TEXT,aliases TEXT,confidence REAL,case_id TEXT,created_at TEXT);
     CREATE TABLE IF NOT EXISTS relationships(id TEXT PRIMARY KEY,source TEXT,target TEXT,type TEXT,timestamp TEXT,confidence REAL,evidence_id TEXT,provenance TEXT);
-    CREATE TABLE IF NOT EXISTS evidence(id TEXT PRIMARY KEY,source TEXT,document_type TEXT,created_at TEXT,hash TEXT,path TEXT,extracted_text TEXT,entities TEXT,audit TEXT);
+    CREATE TABLE IF NOT EXISTS evidence(id TEXT PRIMARY KEY,source TEXT,document_type TEXT,created_at TEXT,hash TEXT,path TEXT,extracted_text TEXT,entities TEXT,audit TEXT,case_id TEXT);
     CREATE TABLE IF NOT EXISTS events(id TEXT PRIMARY KEY,type TEXT,timestamp TEXT,title TEXT,entities TEXT,amount REAL,source TEXT,confidence REAL);
-    CREATE TABLE IF NOT EXISTS jobs(id TEXT PRIMARY KEY,source TEXT,status TEXT,created_at TEXT,result TEXT);
+    CREATE TABLE IF NOT EXISTS jobs(id TEXT PRIMARY KEY,source TEXT,status TEXT,created_at TEXT,result TEXT,case_id TEXT);
     CREATE TABLE IF NOT EXISTS reports(id TEXT PRIMARY KEY,created_at TEXT,content TEXT);
     ''')
+    _migrate_cases_table(c)
+    for table in ('evidence', 'jobs'):
+        columns={row[1] for row in c.execute(f'PRAGMA table_info({table})').fetchall()}
+        if 'case_id' not in columns: c.execute(f'ALTER TABLE {table} ADD COLUMN case_id TEXT')
+    c.execute('UPDATE evidence SET case_id=? WHERE case_id IS NULL', (CASE['id'],))
+    c.execute('UPDATE jobs SET case_id=? WHERE case_id IS NULL', (CASE['id'],))
+    c.commit()
     if c.execute('SELECT count(*) FROM cases').fetchone()[0]: c.close(); return
-    c.execute('INSERT INTO cases VALUES(?,?,?,?)',(CASE['id'],CASE['name'],CASE['status'],CASE['disclaimer']))
+    c.execute('INSERT INTO cases(id,name,status,investigator,priority,stage,disclaimer,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)',
+        (CASE['id'],CASE['name'],CASE['status'],CASE['investigator'],CASE['priority'],CASE['stage'],CASE['disclaimer'],now(),now()))
     for n in DATA['nodes']:
         c.execute('INSERT INTO entities VALUES(?,?,?,?,?,?,?)',(n['id'],n['label'],n['type'],json.dumps(n.get('aliases',[])),n.get('confidence',.8),CASE['id'],now()))
     for e in DATA['edges']:
@@ -47,10 +62,39 @@ def init(force=False):
     for e in DATA['evidence']:
         text=e['preview']; path=EVIDENCE_DIR/f"{e['id']}.txt"; path.write_text(text,encoding='utf-8')
         digest=hashlib.sha256(path.read_bytes()).hexdigest()
-        c.execute('INSERT INTO evidence VALUES(?,?,?,?,?,?,?,?,?)',(e['id'],e['source'],e['document_type'],e['created_at'],digest,str(path),text,json.dumps(e.get('entities',[])),json.dumps(e.get('audit',[]))))
+        c.execute('INSERT INTO evidence VALUES(?,?,?,?,?,?,?,?,?,?)',(e['id'],e['source'],e['document_type'],e['created_at'],digest,str(path),text,json.dumps(e.get('entities',[])),json.dumps(e.get('audit',[])),CASE['id']))
     for e in DATA['events']:
         c.execute('INSERT INTO events VALUES(?,?,?,?,?,?,?,?)',(e['id'],e['type'],e['timestamp'],e['title'],json.dumps(e['entities']),e.get('amount'),e['source'],e['confidence']))
     c.commit(); c.close()
+def list_cases():
+    """All cases with live entity/evidence/anomaly counts for the Case Management view."""
+    cases=query('SELECT * FROM cases ORDER BY created_at DESC')
+    for item in cases:
+        item['entity_count']=one('SELECT count(*) AS n FROM entities WHERE case_id=?',item['id'])['n']
+        item['evidence_count']=one('SELECT count(*) AS n FROM evidence WHERE case_id=?',item['id'])['n']
+        entity_ids=[entity['id'] for entity in query('SELECT id FROM entities WHERE case_id=?',item['id'])]
+        item['relationship_count']=one('SELECT count(*) AS n FROM relationships WHERE source IN ({}) OR target IN ({})'.format(','.join('?'*len(entity_ids)) or "''",','.join('?'*len(entity_ids)) or "''"), *(entity_ids + entity_ids))['n'] if entity_ids else 0
+    return cases
+def create_case(name,investigator='',priority='MEDIUM',stage='EVIDENCE_INGESTION',status='ACTIVE',disclaimer=None):
+    cid='CASE-'+uuid.uuid4().hex[:8].upper()
+    disclaimer=disclaimer or CASE['disclaimer']; timestamp=now()
+    c=conn(); c.execute('INSERT INTO cases(id,name,status,investigator,priority,stage,disclaimer,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)',
+        (cid,name,status,investigator,priority,stage,disclaimer,timestamp,timestamp)); c.commit(); c.close()
+    return one('SELECT * FROM cases WHERE id=?',cid)
+def update_case(case_id,**fields):
+    existing=one('SELECT * FROM cases WHERE id=?',case_id)
+    if not existing: return None
+    allowed={k:v for k,v in fields.items() if v is not None and k in ('name','status','investigator','priority','stage')}
+    if not allowed: return existing
+    allowed['updated_at']=now()
+    assignments=', '.join(f'{column}=?' for column in allowed)
+    c=conn(); c.execute(f'UPDATE cases SET {assignments} WHERE id=?',(*allowed.values(),case_id)); c.commit(); c.close()
+    return one('SELECT * FROM cases WHERE id=?',case_id)
+def delete_case(case_id):
+    remaining=one('SELECT count(*) AS n FROM cases')['n']
+    if remaining<=1: return False
+    c=conn(); c.execute('DELETE FROM cases WHERE id=?',(case_id,)); c.commit(); c.close()
+    return True
 def query(sql,*args):
     c=conn(); rows=c.execute(sql,args).fetchall(); c.close(); return [_loads(r) for r in rows]
 def one(sql,*args):
@@ -171,24 +215,25 @@ def next_id(prefix, table):
     ids=query(f"SELECT id FROM {table} WHERE id LIKE ?",prefix+'%')
     highest=max((int(row['id'].rsplit('-',1)[-1]) for row in ids if row['id'].rsplit('-',1)[-1].isdigit()),default=0)
     return f"{prefix}{highest+1:03}"
-def add_upload(filename, raw, text, document_type='Uploaded document', extraction_method='plain text', extracted=None, structured_extraction=None, warnings=None):
+def add_upload(filename, raw, text, document_type='Uploaded document', extraction_method='plain text', extracted=None, structured_extraction=None, warnings=None, case_id=CASE['id']):
     c=conn()
     try:
+        if not one('SELECT id FROM cases WHERE id=?', case_id): raise ValueError('Case not found')
         evidence_id=next_id('E-', 'evidence'); job_id=str(uuid.uuid4()); path=EVIDENCE_DIR/f'{evidence_id}_{Path(filename).name}'; path.write_bytes(raw)
         digest=hashlib.sha256(raw).hexdigest(); extracted=extracted or extract(text); ids=[]; resolutions=[]
         person_names=[item['value'] for item in extracted.get('typed_entities',[]) if item.get('type')=='PERSON']
         for label in person_names:
             eid,score=resolve(label)
             if not eid:
-                eid=next_id('P-','entities'); c.execute('INSERT INTO entities VALUES(?,?,?,?,?,?,?)',(eid,label,'Person','[]',.78,CASE['id'],now())); c.commit()
+                eid=next_id('P-','entities'); c.execute('INSERT INTO entities VALUES(?,?,?,?,?,?,?)',(eid,label,'Person','[]',.78,case_id,now())); c.commit()
             ids.append(eid); resolutions.append({"mention":label,"entity_id":eid,"confidence":score or .78})
         for label,typ,prefix in [(x,'Phone','PH-') for x in extracted['phones']]+[(x,'BankAccount','BA-') for x in extracted['accounts']]+[(x,'Vehicle','V-') for x in extracted['vehicles']]:
             eid,score=resolve(label,typ)
             if not eid:
-                eid=next_id(prefix,'entities'); c.execute('INSERT INTO entities VALUES(?,?,?,?,?,?,?)',(eid,label,typ,'[]',.99,CASE['id'],now())); c.commit()
+                eid=next_id(prefix,'entities'); c.execute('INSERT INTO entities VALUES(?,?,?,?,?,?,?)',(eid,label,typ,'[]',.99,case_id,now())); c.commit()
             ids.append(eid); resolutions.append({"mention":label,"entity_id":eid,"confidence":score or .99})
-        doc=next_id('DOC-','entities'); c.execute('INSERT INTO entities VALUES(?,?,?,?,?,?,?)',(doc,filename,'Document','[]',1,CASE['id'],now())); c.commit()
-        c.execute('INSERT INTO evidence VALUES(?,?,?,?,?,?,?,?,?)',(evidence_id,filename,document_type,now(),digest,str(path),text,json.dumps(ids),json.dumps(['uploaded','text extracted','entities resolved'])))
+        doc=next_id('DOC-','entities'); c.execute('INSERT INTO entities VALUES(?,?,?,?,?,?,?)',(doc,filename,'Document','[]',1,case_id,now())); c.commit()
+        c.execute('INSERT INTO evidence VALUES(?,?,?,?,?,?,?,?,?,?)',(evidence_id,filename,document_type,now(),digest,str(path),text,json.dumps(ids),json.dumps(['uploaded','text extracted','entities resolved']),case_id))
         rels=0
         for eid in set(ids):
             rid=next_id('R-','relationships'); c.execute('INSERT INTO relationships VALUES(?,?,?,?,?,?,?,?)',(rid,eid,doc,'MENTIONED_IN',now(),.84,evidence_id,'upload extraction')); c.commit(); rels+=1
@@ -198,14 +243,18 @@ def add_upload(filename, raw, text, document_type='Uploaded document', extractio
         result_extraction=dict(structured_extraction or extracted)
         result_extraction.pop('names',None)
         result={"job_id":job_id,"source":filename,"status":"completed","extraction_method":extraction_method,"records_processed":max(1,len(text.splitlines())),"entities_extracted":len(ids),"relationships_created":rels,"events_created":1,"validation_errors":[],"warnings":warnings or [],"extraction":result_extraction,"text_snippet":text[:500],"resolutions":resolutions,"evidence_id":evidence_id,"duration_ms":0}
-        c.execute('INSERT INTO jobs VALUES(?,?,?,?,?)',(job_id,filename,'completed',now(),json.dumps(result))); c.commit(); return result
+        c.execute('INSERT INTO jobs VALUES(?,?,?,?,?,?)',(job_id,filename,'completed',now(),json.dumps(result),case_id)); c.commit(); return result
     except Exception:
         c.rollback()
         raise
     finally:
         c.close()
-def detect_anomalies():
-    events=query('SELECT * FROM events ORDER BY timestamp'); out=[]
+def detect_anomalies(case_id=None):
+    if case_id:
+        events=query('SELECT events.* FROM events LEFT JOIN evidence ON evidence.id=events.source WHERE evidence.case_id=? OR (evidence.id IS NULL AND ?=?) ORDER BY events.timestamp', case_id, case_id, CASE['id'])
+    else:
+        events=query('SELECT * FROM events ORDER BY timestamp')
+    out=[]
     tx=[x for x in events if x['type']=='Transaction' and x.get('amount')]
     if tx:
         threshold=sorted(x['amount'] for x in tx)[max(0,int(len(tx)*.95)-1)]
@@ -224,9 +273,9 @@ def detect_anomalies():
         if len(people)>1: out.append({"id":'AN-L-'+day+loc,"type":"Location overlap","severity":"MEDIUM","confidence":.8,"timestamp":items[0]['timestamp'],"entities":people+[loc],"explanation":f"{len(people)} entities have observed activity at {loc} on {day}.","evidence":list(dict.fromkeys(x['source'] for x in items))})
     risk_graph, analytics=graph()
     return enrich_anomalies(out[:30], risk_graph, analytics)
-def retrieve(question):
+def retrieve(question, case_id=CASE['id']):
     tokens={x.lower() for x in re.findall(r'[a-zA-Z0-9-]{3,}',question)}
-    evidence=query('SELECT * FROM evidence')
+    evidence=query('SELECT * FROM evidence WHERE case_id=?', case_id)
     scored=[]
     for e in evidence:
         corpus=(e['source']+' '+e['extracted_text']).lower(); score=sum(t in corpus for t in tokens)

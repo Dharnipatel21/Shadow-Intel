@@ -4,7 +4,18 @@ from datetime import datetime, timedelta
 import hashlib, random
 import networkx as nx
 
-CASE = {"id":"CASE-SL-01","name":"Operation ShadowLink","status":"ACTIVE","disclaimer":"ShadowIntel assists investigation and evidence analysis. It does not determine guilt, criminality, or legal responsibility."}
+CASE = {
+    "id": "CASE-SL-01",
+    "name": "Operation ShadowLink",
+    "status": "ACTIVE",
+    "investigator": "Investigator A. Menon",
+    "priority": "HIGH",
+    "stage": "RELATIONSHIP_ANALYSIS",
+    "disclaimer": "ShadowIntel assists investigation and evidence analysis. It does not determine guilt, criminality, or legal responsibility.",
+}
+CASE_STATUSES = ["ACTIVE", "ON_HOLD", "PENDING_REVIEW", "CLOSED", "ARCHIVED"]
+CASE_STAGES = ["EVIDENCE_INGESTION", "ENTITY_EXTRACTION", "RELATIONSHIP_ANALYSIS", "RISK_DETECTION", "INVESTIGATOR_REVIEW", "REPORT_GENERATION"]
+CASE_PRIORITIES = ["LOW", "MEDIUM", "HIGH", "CRITICAL"]
 RNG = random.Random(42)
 FIRST = ["Aarav","Meera","Kabir","Isha","Rohan","Nila","Vikram","Tara","Dev","Anaya","Rehan","Maya"]
 LAST = ["Sen","Kapoor","Iyer","Malik","Das","Rao","Bose","Khan","Shah","Nair"]

@@ -11,7 +11,7 @@ const NetworkGraph3D = dynamic(() => import('./components/NetworkGraph3D'), {
 });
 
 const API = process.env.NEXT_PUBLIC_API_URL ?? '';
-const nav = ['Command Center', 'Intelligence Ingestion', 'Network Explorer', 'Entity Intelligence', 'Anomaly & Risk', 'Investigation Timeline', 'AI Investigation Assistant', 'Evidence & Reports'];
+const nav = ['Command Center', 'Case Management', 'Intelligence Ingestion', 'Network Explorer', 'Entity Intelligence', 'Anomaly & Risk', 'Investigation Timeline', 'AI Investigation Assistant', 'Evidence & Reports'];
 type Any = any;
 const get = (p: string) => fetch(API + p).then(async (r) => { if (!r.ok) throw new Error(`API ${r.status}: ${await r.text()}`); return r.json(); });
 
@@ -48,7 +48,130 @@ function Dashboard({ d, graph, theme, error }: Any) {
   );
 }
 
-function Ingest() {
+function CaseManagement({ onCaseChanged, onUploadCase }: { onCaseChanged?: () => void; onUploadCase?: (caseId: string) => void }) {
+  const emptyForm = { name: '', investigator: '', priority: 'MEDIUM', stage: 'EVIDENCE_INGESTION', status: 'ACTIVE' };
+  const [data, setData] = useState<Any>();
+  const [error, setError] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [showForm, setShowForm] = useState(false);
+  const [form, setForm] = useState<Any>(emptyForm);
+  const [editingId, setEditingId] = useState('');
+  const [statusFilter, setStatusFilter] = useState('ALL');
+
+  function load() {
+    get('/api/cases').then(setData).catch((e) => setError(e instanceof Error ? e.message : 'Failed to load cases.'));
+  }
+  useEffect(load, []);
+
+  function startEdit(item: Any) {
+    setEditingId(item.id);
+    setForm({ name: item.name, investigator: item.investigator || '', priority: item.priority, stage: item.stage, status: item.status });
+    setShowForm(true);
+  }
+  function startCreate() {
+    setEditingId('');
+    setForm(emptyForm);
+    setShowForm(true);
+  }
+  async function submit(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setBusy(true); setError('');
+    try {
+      const url = editingId ? `${API}/api/cases/${editingId}` : `${API}/api/cases`;
+      const method = editingId ? 'PATCH' : 'POST';
+      const response = await fetch(url, { method, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(form) });
+      const result = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(result.detail || `Case ${editingId ? 'update' : 'creation'} failed (HTTP ${response.status}).`);
+      setShowForm(false); setEditingId(''); setForm(emptyForm);
+      load(); onCaseChanged?.();
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : 'Case save failed.');
+    } finally {
+      setBusy(false);
+    }
+  }
+  async function remove(id: string) {
+    if (!window.confirm(`Delete case ${id}? This cannot be undone.`)) return;
+    try {
+      const response = await fetch(`${API}/api/cases/${id}`, { method: 'DELETE' });
+      const result = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(result.detail || 'Case could not be deleted.');
+      load(); onCaseChanged?.();
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : 'Case could not be deleted.');
+    }
+  }
+
+  if (error) return <div className="loading">{error}</div>;
+  if (!data) return <div className="loading">Loading case list…</div>;
+  const cases = statusFilter === 'ALL' ? data.cases : data.cases.filter((x: Any) => x.status === statusFilter);
+
+  return (
+    <>
+      <header>
+        <div><p className="eyebrow">CASE MANAGEMENT</p><h1>Case Workspace</h1><p>Create, assign, and track every investigation by ID, status, priority, and stage.</p></div>
+        <button onClick={startCreate}>+ New Case</button>
+      </header>
+      <div className="toolbar">
+        <label>Status
+          <select value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)}>
+            <option value="ALL">All statuses</option>
+            {data.statuses.map((s: string) => <option key={s} value={s}>{s.replaceAll('_', ' ')}</option>)}
+          </select>
+        </label>
+      </div>
+      {showForm && (
+        <Card title={editingId ? `Edit ${editingId}` : 'Create new case'}>
+          <form className="auth-form" onSubmit={submit}>
+            <label>Case name<input value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} required /></label>
+            <label>Assigned investigator<input value={form.investigator} onChange={(e) => setForm({ ...form, investigator: e.target.value })} placeholder="e.g. Investigator A. Menon" /></label>
+            <label>Priority
+              <select value={form.priority} onChange={(e) => setForm({ ...form, priority: e.target.value })}>
+                {data.priorities.map((p: string) => <option key={p} value={p}>{p}</option>)}
+              </select>
+            </label>
+            <label>Investigation stage
+              <select value={form.stage} onChange={(e) => setForm({ ...form, stage: e.target.value })}>
+                {data.stages.map((s: string) => <option key={s} value={s}>{s.replaceAll('_', ' ')}</option>)}
+              </select>
+            </label>
+            <label>Status
+              <select value={form.status} onChange={(e) => setForm({ ...form, status: e.target.value })}>
+                {data.statuses.map((s: string) => <option key={s} value={s}>{s.replaceAll('_', ' ')}</option>)}
+              </select>
+            </label>
+            <div className="toolbar">
+              <button type="submit" disabled={busy}>{busy ? 'Saving…' : editingId ? 'Save changes' : 'Create case'}</button>
+              <button type="button" onClick={() => { setShowForm(false); setEditingId(''); }}>Cancel</button>
+            </div>
+          </form>
+        </Card>
+      )}
+      <Card title={`Cases (${cases.length})`}>
+        <div className="table">
+          {cases.map((item: Any) => (
+            <div className="row" key={item.id} style={{ alignItems: 'flex-start' }}>
+              <div>
+                <b>{item.name}</b>
+                <small>{item.id} · {item.investigator || 'Unassigned'} · Opened {item.created_at?.slice(0, 10)}</small>
+              </div>
+              <Badge>{item.status.replaceAll('_', ' ')}</Badge>
+              <Badge>{item.priority} priority</Badge>
+              <Badge>{item.stage.replaceAll('_', ' ')}</Badge>
+              <small>{item.entity_count} entities · {item.relationship_count} relationships · {item.evidence_count} evidence</small>
+              <button onClick={() => onUploadCase?.(item.id)}>Upload documents</button>
+              <button onClick={() => startEdit(item)}>Edit</button>
+              <button onClick={() => remove(item.id)}>Delete</button>
+            </div>
+          ))}
+          {!cases.length && <p>No cases match this filter.</p>}
+        </div>
+      </Card>
+    </>
+  );
+}
+
+function Ingest({ cases, selectedCaseId, onCaseChange }: { cases: Any[]; selectedCaseId: string; onCaseChange: (caseId: string) => void }) {
   const stages = ['UPLOAD', 'PARSING', 'ENTITY EXTRACTION', 'ENTITY RESOLUTION', 'GRAPH UPDATE', 'ANOMALY ANALYSIS'];
   const [result, setResult] = useState<Any>();
   const [history, setHistory] = useState<Any[]>([]);
@@ -74,6 +197,7 @@ function Ingest() {
     loadHistory();
   }
   async function send(fd: FormData) {
+    fd.append('case_id', selectedCaseId);
     setBusy(true); setError(''); setStatus('Uploading and processing selected source…'); setResult(undefined);
     setStageState(['active', ...stages.slice(1).map(() => 'pending')]);
     try {
@@ -94,6 +218,9 @@ function Ingest() {
   return (
     <>
       <header><div><p className="eyebrow">DATA OPERATIONS</p><h1>Intelligence Ingestion</h1><p>Import reports, CDRs, transactions, locations, or a captioned YouTube source.</p></div></header>
+      <div className="toolbar"><label>Attach to case
+        <select value={selectedCaseId} onChange={(e) => onCaseChange(e.target.value)}>{cases.map((item: Any) => <option key={item.id} value={item.id}>{item.name} · {item.id}</option>)}</select>
+      </label></div>
       <div className="pipeline" aria-label="Ingestion pipeline">
         {stages.map((stage, index) => (
           <div className="pipeline-unit" key={stage}>
@@ -262,13 +389,13 @@ function Timeline({ data, entities, anomalies }: Any) {
   );
 }
 
-function Assistant() {
+function Assistant({ selectedCaseId }: { selectedCaseId: string }) {
   const examples = ['How are P-017 and P-003 connected?', 'What does E-001 say about Aarav Sen?', 'What risk signals involve BA-003?', 'What is known about P-017?'];
   const [q, setQ] = useState(examples[0]), [a, setA] = useState<Any>(), [busy, setBusy] = useState(false), [error, setError] = useState('');
   function investigate() {
     if (!q.trim() || busy) return;
     setBusy(true); setError('');
-    fetch(API + '/api/assistant/query', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ question: q }) })
+    fetch(API + '/api/assistant/query', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ question: q, case_id: selectedCaseId }) })
       .then(async (response) => { const result = await response.json(); if (!response.ok) throw new Error(result.detail || 'Investigation failed'); return result; })
       .then(setA).catch((reason) => setError(reason instanceof Error ? reason.message : 'Investigation failed')).finally(() => setBusy(false));
   }
@@ -329,7 +456,7 @@ function Evidence({ data }: Any) {
     setSelectedDetails([]);
     Promise.all([
       get('/api/evidence/' + item.id),
-      get('/api/case'),
+      get('/api/cases/' + item.case_id),
       ...item.entities.map((entityId: string) => get('/api/entities/' + entityId)),
     ]).then(([detail, currentCase, ...entityDetails]) => {
       setSelected(detail);
@@ -436,6 +563,8 @@ function DashboardApp() {
   const [searchResults, setSearchResults] = useState<Any[]>([]);
   const [selectedEntityId, setSelectedEntityId] = useState('');
   const [user, setUser] = useState<Any>();
+  const [cases, setCases] = useState<Any[]>([]);
+  const [selectedCaseId, setSelectedCaseId] = useState('CASE-SL-01');
   useEffect(() => {
     const token = localStorage.getItem('shadowintel-token');
     if (!token) { router.replace('/login'); return; }
@@ -452,10 +581,15 @@ function DashboardApp() {
   }, [router]);
   useEffect(() => {
     if (!authenticated) return;
-    Promise.all([get('/api/dashboard/summary'), get('/api/entities'), get('/api/graph'), get('/api/anomalies'), get('/api/timeline'), get('/api/evidence')])
+    get('/api/cases').then((result) => { setCases(result.cases); if (result.cases.some((item: Any) => item.id === selectedCaseId)) return; if (result.cases[0]) setSelectedCaseId(result.cases[0].id); }).catch((e) => setError(e instanceof Error ? e.message : 'Failed to load cases'));
+  }, [authenticated, selectedCaseId]);
+  useEffect(() => {
+    if (!authenticated) return;
+    const scope = `?case_id=${encodeURIComponent(selectedCaseId)}`;
+    Promise.all([get('/api/dashboard/summary' + scope), get('/api/entities' + scope), get('/api/graph' + scope), get('/api/anomalies' + scope), get('/api/timeline' + scope), get('/api/evidence' + scope)])
       .then(([d, e, g, a, t, v]) => { setDash(d); setEntities(e); setGraph(g); setAnoms(a); setTimeline(t); setEvidence(v); })
       .catch((e) => setError(e instanceof Error ? e.message : 'Backend request failed'));
-  }, [authenticated]);
+  }, [authenticated, selectedCaseId]);
   useEffect(() => {
     const term = search.trim();
     if (term.length < 2) { setSearchResults([]); return; }
@@ -463,15 +597,16 @@ function DashboardApp() {
     return () => window.clearTimeout(timer);
   }, [search]);
   function signOut() { localStorage.removeItem('shadowintel-token'); router.replace('/login'); }
-  function openEntity(entity: Any) { setSelectedEntityId(entity.id); setPage(nav[3]); setSearch(''); setSearchResults([]); }
+  function openEntity(entity: Any) { setSelectedEntityId(entity.id); setPage(nav[4]); setSearch(''); setSearchResults([]); }
   const body =
     page === nav[0] ? <Dashboard d={dash} graph={graph} theme={theme} error={error} /> :
-    page === nav[1] ? <Ingest /> :
-    page === nav[2] ? <Explorer entities={entities} theme={theme} /> :
-    page === nav[3] ? <EnhancedEntity entities={entities} selectedId={selectedEntityId} /> :
-    page === nav[4] ? <HybridAnomalies data={anoms} /> :
-    page === nav[5] ? <Timeline data={timeline} entities={entities} anomalies={anoms} /> :
-    page === nav[6] ? <Assistant /> :
+    page === nav[1] ? <CaseManagement onCaseChanged={() => get('/api/cases').then((result) => setCases(result.cases)).catch(() => {})} onUploadCase={(caseId) => { setSelectedCaseId(caseId); setPage(nav[2]); }} /> :
+    page === nav[2] ? <Ingest cases={cases} selectedCaseId={selectedCaseId} onCaseChange={setSelectedCaseId} /> :
+    page === nav[3] ? <Explorer entities={entities} theme={theme} /> :
+    page === nav[4] ? <EnhancedEntity entities={entities} selectedId={selectedEntityId} /> :
+    page === nav[5] ? <HybridAnomalies data={anoms} /> :
+    page === nav[6] ? <Timeline data={timeline} entities={entities} anomalies={anoms} /> :
+    page === nav[7] ? <Assistant selectedCaseId={selectedCaseId} /> :
     page === 'Settings' ? <Settings theme={theme} onChange={setTheme} user={user} /> :
     <Evidence data={evidence} />;
   if (!authenticated) return <div className="loading">Verifying secure workspace access…</div>;
@@ -490,6 +625,9 @@ function DashboardApp() {
       <section className="content">
         <div className="top">
           <TopSearch value={search} results={searchResults} onChange={setSearch} onSelect={openEntity} />
+          <label className="workspace-case-picker">Case
+            <select value={selectedCaseId} onChange={(event) => setSelectedCaseId(event.target.value)}>{cases.map((item: Any) => <option key={item.id} value={item.id}>{item.name}</option>)}</select>
+          </label>
           <button className="sidebar-toggle" onClick={() => setSidebarOpen((v) => !v)} aria-label="Toggle sidebar">☰</button>
           <div className="spacer" />
         </div>

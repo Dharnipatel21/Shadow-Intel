@@ -103,6 +103,8 @@ a{color:inherit}
 .top .indicator{display:flex;align-items:center;gap:7px;font-family:var(--font-mono);font-size:11px;white-space:nowrap}
 .top .indicator .dot{width:6px;height:6px;border-radius:50%;background:var(--danger);box-shadow:0 0 0 5px var(--thread-glow)}
 .top .role{font-family:var(--font-mono);font-size:11px;color:var(--text-faint);white-space:nowrap}
+.workspace-case-picker{display:flex;align-items:center;gap:8px;color:var(--text-faint);font:10px var(--font-mono);letter-spacing:.8px;text-transform:uppercase;white-space:nowrap}
+.workspace-case-picker select{max-width:220px}
 
 .theme-toggle{display:flex;align-items:center;gap:2px;background:var(--surface);border:1px solid var(--border);border-radius:999px;padding:3px}
 .theme-toggle button{border:0;background:transparent;color:var(--text-faint);padding:6px 12px;border-radius:999px;font-size:10.5px;font-family:var(--font-mono);letter-spacing:.5px;cursor:pointer;transition:background-color .15s ease,color .15s ease}

@@ -7,7 +7,7 @@ from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Query, Reque
 from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from . import store, auth, config, llm, export
+from . import store, auth, config, llm, export, data
 
 app=FastAPI(title='ShadowIntel API',version='2.0')
 app.add_middleware(CORSMiddleware,allow_origins=['http://localhost:3000','http://127.0.0.1:3000'],allow_origin_regex=r'^https?://(localhost|127\.0\.0\.1|192\.168\.\d{1,3}\.\d{1,3})(:\d+)?$',allow_methods=['*'],allow_headers=['*'])
@@ -135,19 +135,78 @@ def google_callback(code: str, state: str = ''):
 def health(): return {'status':'healthy','case':case()['name'],'database':str(store.DB)}
 @app.get('/api/case')
 def case_api(): return case()
+
+class CaseCreateBody(BaseModel):
+    name: str
+    investigator: str = ''
+    priority: str = 'MEDIUM'
+    stage: str = 'EVIDENCE_INGESTION'
+    status: str = 'ACTIVE'
+
+class CaseUpdateBody(BaseModel):
+    name: str | None = None
+    status: str | None = None
+    investigator: str | None = None
+    priority: str | None = None
+    stage: str | None = None
+
+def validate_choice(value, choices, field):
+    if value is not None and value not in choices:
+        raise HTTPException(422, f"Invalid {field} '{value}'. Must be one of: {', '.join(choices)}.")
+
+@app.get('/api/cases')
+def cases_list():
+    """Case Management: every case with live entity/evidence/relationship counts."""
+    return {'cases': store.list_cases(), 'statuses': data.CASE_STATUSES, 'stages': data.CASE_STAGES, 'priorities': data.CASE_PRIORITIES}
+
+@app.post('/api/cases')
+def cases_create(body: CaseCreateBody):
+    validate_choice(body.status, data.CASE_STATUSES, 'status')
+    validate_choice(body.priority, data.CASE_PRIORITIES, 'priority')
+    validate_choice(body.stage, data.CASE_STAGES, 'stage')
+    if not body.name.strip():
+        raise HTTPException(422, 'Case name is required.')
+    return store.create_case(body.name.strip(), body.investigator.strip(), body.priority, body.stage, body.status)
+
+@app.get('/api/cases/{case_id}')
+def cases_detail(case_id: str):
+    x = store.one('SELECT * FROM cases WHERE id=?', case_id)
+    if not x: raise HTTPException(404, 'Case not found')
+    return x
+
+@app.patch('/api/cases/{case_id}')
+def cases_update(case_id: str, body: CaseUpdateBody):
+    validate_choice(body.status, data.CASE_STATUSES, 'status')
+    validate_choice(body.priority, data.CASE_PRIORITIES, 'priority')
+    validate_choice(body.stage, data.CASE_STAGES, 'stage')
+    updated = store.update_case(case_id, name=body.name, status=body.status, investigator=body.investigator, priority=body.priority, stage=body.stage)
+    if not updated: raise HTTPException(404, 'Case not found')
+    return updated
+
+@app.delete('/api/cases/{case_id}')
+def cases_delete(case_id: str):
+    if not store.one('SELECT id FROM cases WHERE id=?', case_id):
+        raise HTTPException(404, 'Case not found')
+    if not store.delete_case(case_id):
+        raise HTTPException(400, 'Cannot delete the last remaining case.')
+    return {'deleted': case_id}
 @app.get('/api/dashboard')
-def dashboard():
-    nodes=store.enrich(store.query('SELECT * FROM entities')); alerts=store.detect_anomalies(); priority=sorted(nodes,key=lambda x:x['priority'],reverse=True)
+def dashboard(case_id:str='CASE-SL-01'):
+    selected=store.one('SELECT * FROM cases WHERE id=?',case_id)
+    if not selected: raise HTTPException(404,'Case not found')
+    nodes=store.enrich(store.query('SELECT * FROM entities WHERE case_id=?',case_id)); alerts=store.detect_anomalies(); priority=sorted(nodes,key=lambda x:x['priority'],reverse=True)
     return {'case':case(),'kpis':{'entities':len(nodes),'relationships':len(store.query('SELECT id FROM relationships')),'anomalies':len(alerts),'priority':len([x for x in priority if x['priority']>=35]),'evidence':len(store.query('SELECT id FROM evidence'))},'priority':priority[:7],'anomalies':alerts[:5],'activity':store.query('SELECT * FROM events ORDER BY timestamp DESC LIMIT 7')}
 @app.get('/api/dashboard/summary')
-def dashboard_summary():
+def dashboard_summary(case_id:str='CASE-SL-01'):
     """Single source for Command Center widgets, calculated from the live store."""
-    nodes=store.enrich(store.query('SELECT * FROM entities'))
+    selected=store.one('SELECT * FROM cases WHERE id=?',case_id)
+    if not selected: raise HTTPException(404,'Case not found')
+    nodes=store.enrich(store.query('SELECT * FROM entities WHERE case_id=?',case_id))
     priority=sorted(nodes,key=lambda x:x['priority'],reverse=True)
     alerts=store.detect_anomalies()
     active_cases=store.query("SELECT id FROM cases WHERE status='ACTIVE'")
     return {
-        'case':case(),
+        'case':selected,
         'metrics':{
             'active_cases':len(active_cases),
             'entities':len(nodes),
@@ -160,9 +219,9 @@ def dashboard_summary():
         'recent_activity':store.query('SELECT * FROM events ORDER BY timestamp DESC LIMIT 7'),
     }
 @app.get('/api/entities')
-def entities(q:str=''):
+def entities(q:str='',case_id:str='CASE-SL-01'):
     term=q.strip().casefold()
-    items=store.query('SELECT * FROM entities')
+    items=store.query('SELECT * FROM entities WHERE case_id=?',case_id)
     if term:
         normalized_term=re.sub(r'[^a-z0-9]','',term)
         items=[item for item in items if any(
@@ -182,8 +241,10 @@ def entity_evidence(entity_id:str): entity_or_404(entity_id); return [x for x in
 @app.get('/api/entities/{entity_id}/correlations')
 def entity_correlations(entity_id:str): entity_or_404(entity_id); return store.cross_source_correlations(entity_id)
 @app.get('/api/graph')
-def graph(q:str='',focus:str='',hops:int=Query(0,ge=0,le=3),type:str=''):
-    nodes=store.enrich(store.query('SELECT * FROM entities')); edges=store.query('SELECT * FROM relationships'); g,_=store.graph(); selected=set(g.nodes)
+def graph(q:str='',focus:str='',hops:int=Query(0,ge=0,le=3),type:str='',case_id:str='CASE-SL-01'):
+    nodes=store.enrich(store.query('SELECT * FROM entities WHERE case_id=?',case_id)); node_ids={x['id'] for x in nodes}; edges=[x for x in store.query('SELECT * FROM relationships') if x['source'] in node_ids and x['target'] in node_ids]
+    import networkx as nx
+    g=nx.Graph(); g.add_nodes_from(node_ids); g.add_edges_from((x['source'],x['target']) for x in edges); selected=set(g.nodes)
     if focus:
         if focus not in g: raise HTTPException(404,'Graph entity not found')
         import networkx as nx; selected=set(nx.single_source_shortest_path_length(g,focus,cutoff=max(hops,1)).keys())
@@ -212,7 +273,7 @@ def path(source:str,target:str,max_paths:int=Query(5,ge=1,le=10)):
     primary=alternatives[0]
     return {'path':primary['path'],'relationships':primary['relationships'],'paths':alternatives,'message':f'Found {len(alternatives)} observed shortest path(s).'}
 @app.get('/api/anomalies')
-def anomalies(): return store.detect_anomalies()
+def anomalies(case_id:str='CASE-SL-01'): return store.detect_anomalies(case_id)
 @app.get('/api/anomalies/{anomaly_id}')
 def anomaly(anomaly_id:str):
     x=next((x for x in store.detect_anomalies() if x['id']==anomaly_id),None)
@@ -221,11 +282,12 @@ def anomaly(anomaly_id:str):
 @app.post('/api/anomalies/analyze')
 def analyze(): return {'status':'completed','anomalies':store.detect_anomalies()}
 @app.get('/api/timeline')
-def timeline(entity:str='',kind:str='',start:str='',end:str='',source:str=''):
-    return [x for x in store.query('SELECT * FROM events ORDER BY timestamp DESC') if (not entity or entity in x['entities']) and (not kind or x['type'].lower()==kind.lower()) and (not start or x['timestamp']>=start) and (not end or x['timestamp']<=end) and (not source or x['source']==source)]
+def timeline(entity:str='',kind:str='',start:str='',end:str='',source:str='',case_id:str='CASE-SL-01'):
+    events=store.query('SELECT events.* FROM events LEFT JOIN evidence ON evidence.id=events.source WHERE evidence.case_id=? OR (evidence.id IS NULL AND ?=?) ORDER BY events.timestamp DESC',case_id,case_id,'CASE-SL-01')
+    return [x for x in events if (not entity or entity in x['entities']) and (not kind or x['type'].lower()==kind.lower()) and (not start or x['timestamp']>=start) and (not end or x['timestamp']<=end) and (not source or x['source']==source)]
 @app.get('/api/evidence')
-def evidence(q:str=''):
-    return [x for x in store.query('SELECT * FROM evidence ORDER BY created_at DESC') if not q or q.lower() in (x['id']+x['source']+x['extracted_text']).lower()]
+def evidence(q:str='',case_id:str='CASE-SL-01'):
+    return [x for x in store.query('SELECT * FROM evidence WHERE case_id=? ORDER BY created_at DESC',case_id) if not q or q.lower() in (x['id']+x['source']+x['extracted_text']).lower()]
 @app.get('/api/evidence/{evidence_id}')
 def evidence_detail(evidence_id:str):
     x=store.one('SELECT * FROM evidence WHERE id=?',evidence_id)
@@ -294,11 +356,12 @@ def youtube_text(url):
     return text,video_id
 @app.post('/api/ingestion/upload')
 @app.post('/api/ingest')
-async def ingest(file:UploadFile|None=File(None), url:str|None=Form(None)):
+async def ingest(file:UploadFile|None=File(None), url:str|None=Form(None), case_id:str=Form('CASE-SL-01')):
+    if not store.one('SELECT id FROM cases WHERE id=?', case_id): raise HTTPException(404, 'Case not found')
     began=perf_counter(); raw=await file.read() if file else b''
     if url:
         if file: raise HTTPException(422,'Provide either a file or a YouTube URL, not both.')
-        text,video_id=youtube_text(url); raw=text.encode('utf-8'); result=store.add_upload(f'youtube_{video_id}.txt',raw,text,'YouTube transcript','transcript')
+        text,video_id=youtube_text(url); raw=text.encode('utf-8'); result=store.add_upload(f'youtube_{video_id}.txt',raw,text,'YouTube transcript','transcript',case_id=case_id)
     else:
         if not file or not raw: raise HTTPException(422,'Provide a non-empty file or a YouTube URL.')
         text,method=document_text(file,raw)
@@ -312,13 +375,13 @@ async def ingest(file:UploadFile|None=File(None), url:str|None=Form(None)):
             except Exception as error:
                 warnings.append(f'LLM extraction unavailable or failed validation; deterministic extraction used: {error}')
                 extraction_method=f'{method} (deterministic fallback)'
-        result=store.add_upload(file.filename or 'upload',raw,text,method,extraction_method,extracted=extracted,structured_extraction=structured,warnings=warnings)
+        result=store.add_upload(file.filename or 'upload',raw,text,method,extraction_method,extracted=extracted,structured_extraction=structured,warnings=warnings,case_id=case_id)
     # Real rule-generated result for the final ingestion pipeline stage.
     result['anomaly_count']=len(store.detect_anomalies())
     result['duration_ms']=round((perf_counter()-began)*1000,2); return result
 @app.get('/api/ingestion/jobs')
-def jobs():
-    items=store.query('SELECT * FROM jobs ORDER BY created_at DESC')
+def jobs(case_id:str='CASE-SL-01'):
+    items=store.query('SELECT * FROM jobs WHERE case_id=? ORDER BY created_at DESC',case_id)
     for item in items: item['result']=json.loads(item['result'])
     return items
 @app.get('/api/ingestion/jobs/{job_id}')
@@ -328,8 +391,8 @@ def job(job_id:str):
     x['result']=json.loads(x['result']); return x
 def question_entities(question):
     q=question.lower(); return [x for x in store.enrich(store.query('SELECT * FROM entities')) if x['label'].lower() in q or x['id'].lower() in q]
-def answer(question):
-    docs=store.retrieve(question); matched=question_entities(question); rel=[]
+def answer(question, case_id='CASE-SL-01'):
+    docs=store.retrieve(question, case_id); matched=[x for x in question_entities(question) if x.get('case_id') == case_id]; rel=[]
     if len(matched)>=2: rel=path(matched[0]['id'],matched[1]['id'])['relationships']
     alerts=[alert for alert in store.detect_anomalies() if any(entity['id'] in alert.get('entities',[]) for entity in matched)]
     sources=list(dict.fromkeys([d['id'] for d in docs]+[r['evidence_id'] for r in rel if r.get('evidence_id')]+[evidence for alert in alerts for evidence in alert.get('evidence',[])]))
@@ -349,7 +412,7 @@ def answer(question):
     return {'provider':provider,'finding':finding,'observed_evidence':observed,'inference':'The retrieved records may indicate an association for investigator review; they do not establish guilt or legal responsibility.','confidence':confidence,'sources':sources,'evidence_ids':sources,'entity_ids':entity_ids}
 @app.post('/api/assistant/query')
 @app.post('/api/assistant')
-def assistant(payload:dict): return answer(payload.get('question',''))
+def assistant(payload:dict): return answer(payload.get('question',''), payload.get('case_id','CASE-SL-01'))
 @app.post('/api/reports/generate')
 @app.get('/api/report')
 def report():
@@ -388,3 +451,4 @@ def report_export_pdf(report_id:str):
     content=json.loads(x['content'])
     buffer=export.report_to_pdf(content)
     return StreamingResponse(buffer,media_type='application/pdf',headers={'Content-Disposition':f'attachment; filename="{report_id}.pdf"'})
+    
