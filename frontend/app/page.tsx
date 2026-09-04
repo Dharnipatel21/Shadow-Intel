@@ -391,8 +391,9 @@ function Timeline({ data, entities, anomalies }: Any) {
 
 function Assistant({ selectedCaseId, onOpenEvidence }: { selectedCaseId: string; onOpenEvidence: (id: string) => void }) {
   const examples = ['How are P-017 and P-003 connected?', 'What does E-001 say about Aarav Sen?', 'What risk signals involve BA-003?', 'What is known about P-017?'];
-  const [q, setQ] = useState(examples[0]), [a, setA] = useState<Any>(), [history, setHistory] = useState<Any[]>([]), [busy, setBusy] = useState(false), [error, setError] = useState(''), [showWhy, setShowWhy] = useState(false);
-  useEffect(() => { setA(undefined); get('/api/assistant/history?case_id=' + encodeURIComponent(selectedCaseId)).then(setHistory).catch(() => setHistory([])); }, [selectedCaseId]);
+  const [q, setQ] = useState(examples[0]), [a, setA] = useState<Any>(), [history, setHistory] = useState<Any[]>([]), [busy, setBusy] = useState(false), [error, setError] = useState(''), [showWhy, setShowWhy] = useState(false), [showAllHistory, setShowAllHistory] = useState(false);
+
+  useEffect(() => { setA(undefined); setShowAllHistory(false); get('/api/assistant/history?case_id=' + encodeURIComponent(selectedCaseId)).then(setHistory).catch(() => setHistory([])); }, [selectedCaseId]);
   function investigate() {
     if (!q.trim() || busy) return;
     setBusy(true); setError(''); setShowWhy(false);
@@ -401,6 +402,8 @@ function Assistant({ selectedCaseId, onOpenEvidence }: { selectedCaseId: string;
       .then((result) => { setA(result); setHistory((items) => [...items, { id: crypto.randomUUID(), question: q, answer: result, language: result.language, created_at: new Date().toISOString() }]); }).catch((reason) => setError(reason instanceof Error ? reason.message : 'Investigation failed')).finally(() => setBusy(false));
   }
   const evidenceCites: string[] = a?.evidence_ids || a?.sources || [];
+  const recentHistory = history.slice().reverse();
+  const visibleHistory = showAllHistory ? recentHistory : recentHistory.slice(0, 5);
   return (
     <>
       <header><div><p className="eyebrow">EVIDENCE-BACKED COPILOT</p><h1>AI Investigation Assistant</h1><p>Every response is grounded in stored graph and evidence records{a ? (a.provider === 'groq-llm' ? ' and phrased by an LLM.' : '.') : '.'}</p></div></header>
@@ -409,7 +412,6 @@ function Assistant({ selectedCaseId, onOpenEvidence }: { selectedCaseId: string;
         <div className="assistant-examples" aria-label="Example questions">{examples.map((example) => <button key={example} className="example-question" onClick={() => setQ(example)}>{example}</button>)}</div>
         <button onClick={investigate} disabled={busy || !q.trim()}>{busy ? 'Retrieving…' : 'Investigate'}</button>
         {error && <p className="notice">{error}</p>}
-        {history.length > 0 && <Card title="Saved investigation history">{history.slice().reverse().map((item: Any) => <div className="row" key={item.id}><button className="example-question" onClick={() => { setQ(item.question); setA(item.answer); }}><b>{item.question}</b><small>{item.language} · {new Date(item.created_at).toLocaleString()}</small></button></div>)}</Card>}
         {a && (
           <Card title="Finding">
             <Badge>{a.provider === 'groq-llm' ? 'LLM-ANSWERED' : 'DETERMINISTIC RETRIEVAL'}</Badge>
@@ -428,7 +430,19 @@ function Assistant({ selectedCaseId, onOpenEvidence }: { selectedCaseId: string;
               </>
             )}
             {a.evidence_gaps?.length > 0 && (<><h4>WHAT EVIDENCE IS MISSING</h4><ul className="why-list">{a.evidence_gaps.map((line: string, i: number) => <li key={i}>{line}</li>)}</ul></>)}
-            {a.next_step && (<><h4>POSSIBLE NEXT STEP</h4><p>{a.next_step}</p></>)}
+          </Card>
+        )}
+        {history.length > 0 && (
+          <Card title="Saved investigation history">
+            {visibleHistory.map((item: Any) => (
+              <div className="row" key={item.id}>
+                <button className="example-question" onClick={() => { setQ(item.question); setA(item.answer); }}>
+                  <b>{item.question}</b>
+                  <small>{item.language} · {new Date(item.created_at).toLocaleString()}</small>
+                </button>
+              </div>
+            ))}
+            {!showAllHistory && history.length > 5 && <button className="example-question" onClick={() => setShowAllHistory(true)}>View More</button>}
           </Card>
         )}
       </div>
@@ -610,6 +624,7 @@ function DashboardApp() {
   const [user, setUser] = useState<Any>();
   const [cases, setCases] = useState<Any[]>([]);
   const [selectedCaseId, setSelectedCaseId] = useState('CASE-SL-01');
+  const [caseSearch, setCaseSearch] = useState('');
   useEffect(() => {
     const token = localStorage.getItem('shadowintel-token');
     if (!token) { router.replace('/login'); return; }
@@ -626,7 +641,7 @@ function DashboardApp() {
   }, [router]);
   useEffect(() => {
     if (!authenticated) return;
-    get('/api/cases').then((result) => { setCases(result.cases); if (result.cases.some((item: Any) => item.id === selectedCaseId)) return; if (result.cases[0]) setSelectedCaseId(result.cases[0].id); }).catch((e) => setError(e instanceof Error ? e.message : 'Failed to load cases'));
+    get('/api/cases').then((result) => { setCases(result.cases); if (selectedCaseId === 'ALL_CASES' || result.cases.some((item: Any) => item.id === selectedCaseId)) return; if (result.cases[0]) setSelectedCaseId(result.cases[0].id); }).catch((e) => setError(e instanceof Error ? e.message : 'Failed to load cases'));
   }, [authenticated, selectedCaseId]);
   useEffect(() => {
     if (!authenticated) return;
@@ -644,6 +659,10 @@ function DashboardApp() {
   function signOut() { localStorage.removeItem('shadowintel-token'); router.replace('/login'); }
   function openEntity(entity: Any) { setSelectedEntityId(entity.id); setPage(nav[4]); setSearch(''); setSearchResults([]); }
   function openEvidence(id: string) { setFocusEvidenceId(id); setPage(nav[8]); }
+  const visibleCases=cases.filter((item) => {
+    const term=caseSearch.trim().toLowerCase();
+    return !term || `${item.name} ${item.id}`.toLowerCase().includes(term);
+  });
   const body =
     page === nav[0] ? <Dashboard d={dash} graph={graph} theme={theme} error={error} /> :
     page === nav[1] ? <CaseManagement onCaseChanged={() => get('/api/cases').then((result) => setCases(result.cases)).catch(() => {})} onUploadCase={(caseId) => { setSelectedCaseId(caseId); setPage(nav[2]); }} /> :
@@ -673,8 +692,12 @@ function DashboardApp() {
         <div className="top">
           <TopSearch value={search} results={searchResults} onChange={setSearch} onSelect={openEntity} />
           <label className="workspace-case-picker">Case
-            <select value={selectedCaseId} onChange={(event) => setSelectedCaseId(event.target.value)}>{cases.map((item: Any) => <option key={item.id} value={item.id}>{item.name}</option>)}</select>
+            <select value={selectedCaseId} onChange={(event) => setSelectedCaseId(event.target.value)}>
+              <option value="ALL_CASES">All Cases</option>
+              {visibleCases.map((item: Any) => <option key={item.id} value={item.id}>{item.name}</option>)}
+            </select>
           </label>
+          <div className="case-search"><input value={caseSearch} onChange={(event) => setCaseSearch(event.target.value)} placeholder="Search cases..." aria-label="Search cases" /></div>
           <button className="sidebar-toggle" onClick={() => setSidebarOpen((v) => !v)} aria-label="Toggle sidebar">☰</button>
           <div className="spacer" />
         </div>

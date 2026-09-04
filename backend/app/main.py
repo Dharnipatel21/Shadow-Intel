@@ -18,6 +18,11 @@ async def unexpected_error(request:Request, exc:Exception):
 store.init()
 @app.on_event('startup')
 def startup(): store.init(); auth.init_auth()
+ALL_CASES='ALL_CASES'
+def case_scope(case_id):
+    return None if case_id in (None, '', ALL_CASES) else case_id
+def all_cases_summary():
+    return {'id':ALL_CASES,'name':'All Cases','status':'ACTIVE','investigator':'','priority':'','stage':'','disclaimer':'All case records are included in this workspace view.'}
 def case(): return store.one('SELECT * FROM cases LIMIT 1')
 def entity_or_404(id):
     x=store.one('SELECT * FROM entities WHERE id=?',id)
@@ -282,9 +287,9 @@ def dashboard(case_id:str='CASE-SL-01'):
 @app.get('/api/dashboard/summary')
 def dashboard_summary(case_id:str='CASE-SL-01'):
     """Single source for Command Center widgets, calculated from the live store."""
-    selected=store.one('SELECT * FROM cases WHERE id=?',case_id)
+    scope=case_scope(case_id); selected=all_cases_summary() if scope is None else store.one('SELECT * FROM cases WHERE id=?',scope)
     if not selected: raise HTTPException(404,'Case not found')
-    nodes=store.enrich(store.query('SELECT * FROM entities WHERE case_id=?',case_id))
+    nodes=store.enrich(store.query('SELECT * FROM entities') if scope is None else store.query('SELECT * FROM entities WHERE case_id=?',scope))
     priority=sorted(nodes,key=lambda x:x['priority'],reverse=True)
     alerts=store.detect_anomalies()
     active_cases=store.query("SELECT id FROM cases WHERE status='ACTIVE'")
@@ -304,7 +309,7 @@ def dashboard_summary(case_id:str='CASE-SL-01'):
 @app.get('/api/entities')
 def entities(q:str='',case_id:str='CASE-SL-01'):
     term=q.strip().casefold()
-    items=store.query('SELECT * FROM entities WHERE case_id=?',case_id)
+    scope=case_scope(case_id); items=store.query('SELECT * FROM entities') if scope is None else store.query('SELECT * FROM entities WHERE case_id=?',scope)
     if term:
         normalized_term=re.sub(r'[^a-z0-9]','',term)
         items=[item for item in items if any(
@@ -325,7 +330,7 @@ def entity_evidence(entity_id:str): entity_or_404(entity_id); return [x for x in
 def entity_correlations(entity_id:str): entity_or_404(entity_id); return store.cross_source_correlations(entity_id)
 @app.get('/api/graph')
 def graph(q:str='',focus:str='',hops:int=Query(0,ge=0,le=3),type:str='',case_id:str='CASE-SL-01'):
-    nodes=store.enrich(store.query('SELECT * FROM entities WHERE case_id=?',case_id)); node_ids={x['id'] for x in nodes}; edges=[x for x in store.query('SELECT * FROM relationships') if x['source'] in node_ids and x['target'] in node_ids]
+    scope=case_scope(case_id); nodes=store.enrich(store.query('SELECT * FROM entities') if scope is None else store.query('SELECT * FROM entities WHERE case_id=?',scope)); node_ids={x['id'] for x in nodes}; edges=[x for x in store.query('SELECT * FROM relationships') if x['source'] in node_ids and x['target'] in node_ids]
     import networkx as nx
     g=nx.Graph(); g.add_nodes_from(node_ids); g.add_edges_from((x['source'],x['target']) for x in edges); selected=set(g.nodes)
     if focus:
@@ -356,7 +361,7 @@ def path(source:str,target:str,max_paths:int=Query(5,ge=1,le=10)):
     primary=alternatives[0]
     return {'path':primary['path'],'relationships':primary['relationships'],'paths':alternatives,'message':f'Found {len(alternatives)} observed shortest path(s).'}
 @app.get('/api/anomalies')
-def anomalies(case_id:str='CASE-SL-01'): return store.detect_anomalies(case_id)
+def anomalies(case_id:str='CASE-SL-01'): return store.detect_anomalies(case_scope(case_id))
 @app.get('/api/anomalies/{anomaly_id}')
 def anomaly(anomaly_id:str):
     x=next((x for x in store.detect_anomalies() if x['id']==anomaly_id),None)
@@ -366,11 +371,13 @@ def anomaly(anomaly_id:str):
 def analyze(): return {'status':'completed','anomalies':store.detect_anomalies()}
 @app.get('/api/timeline')
 def timeline(entity:str='',kind:str='',start:str='',end:str='',source:str='',case_id:str='CASE-SL-01'):
-    events=store.query('SELECT events.* FROM events LEFT JOIN evidence ON evidence.id=events.source WHERE evidence.case_id=? OR (evidence.id IS NULL AND ?=?) ORDER BY events.timestamp DESC',case_id,case_id,'CASE-SL-01')
+    scope=case_scope(case_id)
+    events=store.query('SELECT events.* FROM events LEFT JOIN evidence ON evidence.id=events.source ORDER BY events.timestamp DESC') if scope is None else store.query('SELECT events.* FROM events LEFT JOIN evidence ON evidence.id=events.source WHERE evidence.case_id=? OR (evidence.id IS NULL AND ?=?) ORDER BY events.timestamp DESC',scope,scope,'CASE-SL-01')
     return [x for x in events if (not entity or entity in x['entities']) and (not kind or x['type'].lower()==kind.lower()) and (not start or x['timestamp']>=start) and (not end or x['timestamp']<=end) and (not source or x['source']==source)]
 @app.get('/api/evidence')
 def evidence(q:str='',case_id:str='CASE-SL-01'):
-    return [x for x in store.query('SELECT * FROM evidence WHERE case_id=? ORDER BY created_at DESC',case_id) if not q or q.lower() in (x['id']+x['source']+x['extracted_text']).lower()]
+    scope=case_scope(case_id); items=store.query('SELECT * FROM evidence ORDER BY created_at DESC') if scope is None else store.query('SELECT * FROM evidence WHERE case_id=? ORDER BY created_at DESC',scope)
+    return [x for x in items if not q or q.lower() in (x['id']+x['source']+x['extracted_text']).lower()]
 @app.get('/api/evidence/{evidence_id}')
 def evidence_detail(evidence_id:str):
     x=store.one('SELECT * FROM evidence WHERE id=?',evidence_id)
@@ -521,8 +528,8 @@ OBSERVED_COPY={
     'gu': lambda count, relationships: f"{count} પુરાવા આધારિત અવલોકનો મળ્યા." if not relationships else f"{relationships} અવલોકિત ગ્રાફ સંબંધો ઓળખાયેલી એન્ટિટીઓને જોડે છે.",
 }
 def answer(question, case_id='CASE-SL-01'):
-    question_language=language.detect_language(question); response_language=language.language_name(question_language); copy=ASSISTANT_COPY[question_language]
-    docs=store.retrieve(question, case_id); matched=[x for x in question_entities(question) if x.get('case_id') == case_id]; rel=[]
+    question_language=language.detect_language(question); response_language=language.language_name(question_language); copy=ASSISTANT_COPY[question_language]; scope=case_scope(case_id)
+    docs=store.retrieve(question, scope); matched=[x for x in question_entities(question) if scope is None or x.get('case_id') == scope]; rel=[]
     if len(matched)>=2: rel=path(matched[0]['id'],matched[1]['id'])['relationships']
     alerts=[alert for alert in store.detect_anomalies() if any(entity['id'] in alert.get('entities',[]) for entity in matched)]
     sources=list(dict.fromkeys([d['id'] for d in docs]+[r['evidence_id'] for r in rel if r.get('evidence_id')]+[evidence for alert in alerts for evidence in alert.get('evidence',[])]))
@@ -559,8 +566,10 @@ def assistant(payload:dict):
     return result
 @app.get('/api/assistant/history')
 def assistant_history(case_id: str='CASE-SL-01'):
-    if not store.one('SELECT id FROM cases WHERE id=?', case_id): raise HTTPException(404, 'Case not found')
-    return store.list_assistant_messages(case_id)
+    scope=case_scope(case_id)
+    if scope is None: return store.list_assistant_messages(None)
+    if not store.one('SELECT id FROM cases WHERE id=?', scope): raise HTTPException(404, 'Case not found')
+    return store.list_assistant_messages(scope)
 @app.post('/api/reports/generate')
 @app.get('/api/report')
 def report():

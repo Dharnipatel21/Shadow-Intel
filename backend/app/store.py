@@ -303,7 +303,7 @@ def _ensure_blackboard_schema():
 def retrieve(question, case_id=CASE['id']):
     # Keep Unicode words intact so retrieval works for every supported script.
     tokens={x.casefold() for x in re.findall(r'[\w-]{2,}',question,flags=re.UNICODE)}
-    evidence=query('SELECT * FROM evidence WHERE case_id=?', case_id)
+    evidence=query('SELECT * FROM evidence') if case_id in (None, '', 'ALL_CASES') else query('SELECT * FROM evidence WHERE case_id=?', case_id)
     scored=[]
     for e in evidence:
         corpus=(e['source']+' '+e['extracted_text']).casefold(); score=sum(t in corpus for t in tokens)
@@ -349,12 +349,12 @@ def delete_blackboard_connection(connection_id):
     return True
 
 def add_assistant_message(case_id, question, answer, language):
-    if not one('SELECT id FROM cases WHERE id=?', case_id): raise ValueError('Case not found')
+    if case_id != 'ALL_CASES' and not one('SELECT id FROM cases WHERE id=?', case_id): raise ValueError('Case not found')
     message_id=next_id('CHAT-', 'assistant_messages'); timestamp=now()
     c=conn(); c.execute('INSERT INTO assistant_messages VALUES(?,?,?,?,?,?)', (message_id,case_id,question,json.dumps(answer),language,timestamp)); c.commit(); c.close()
     return one('SELECT * FROM assistant_messages WHERE id=?', message_id)
 
 def list_assistant_messages(case_id):
-    items=query('SELECT * FROM assistant_messages WHERE case_id=? ORDER BY created_at ASC', case_id)
+    items=query('SELECT * FROM assistant_messages ORDER BY created_at ASC') if case_id in (None, '', 'ALL_CASES') else query('SELECT * FROM assistant_messages WHERE case_id=? ORDER BY created_at ASC', case_id)
     for item in items: item['answer']=json.loads(item['answer'])
     return items
