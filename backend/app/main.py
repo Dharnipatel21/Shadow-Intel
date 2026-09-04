@@ -190,6 +190,89 @@ def cases_delete(case_id: str):
     if not store.delete_case(case_id):
         raise HTTPException(400, 'Cannot delete the last remaining case.')
     return {'deleted': case_id}
+
+BLACKBOARD_KINDS = ('ENTITY', 'EVIDENCE', 'NOTE', 'HYPOTHESIS')
+BLACKBOARD_STATUSES = ('', 'OPEN', 'SUPPORTED', 'CHALLENGED', 'REJECTED')
+
+class BlackboardItemCreate(BaseModel):
+    case_id: str = 'CASE-SL-01'
+    kind: str
+    title: str
+    content: str = ''
+    ref_id: str | None = None
+    status: str = ''
+    x: float = 40.0
+    y: float = 40.0
+    color: str = 'amber'
+    created_by: str = ''
+
+class BlackboardItemUpdate(BaseModel):
+    title: str | None = None
+    content: str | None = None
+    status: str | None = None
+    x: float | None = None
+    y: float | None = None
+    color: str | None = None
+
+class BlackboardConnectionCreate(BaseModel):
+    case_id: str = 'CASE-SL-01'
+    from_id: str
+    to_id: str
+    label: str = ''
+
+@app.get('/api/blackboard')
+def blackboard_get(case_id: str = 'CASE-SL-01'):
+    """Live Investigation Blackboard: pinned entities/evidence, notes, hypotheses, and their connections."""
+    if not store.one('SELECT id FROM cases WHERE id=?', case_id):
+        raise HTTPException(404, 'Case not found')
+    return store.list_blackboard(case_id)
+
+@app.post('/api/blackboard/items')
+def blackboard_item_create(body: BlackboardItemCreate):
+    validate_choice(body.kind, BLACKBOARD_KINDS, 'kind')
+    if body.status:
+        validate_choice(body.status, BLACKBOARD_STATUSES, 'status')
+    if not body.title.strip():
+        raise HTTPException(422, 'A title is required.')
+    if body.kind == 'ENTITY' and not (body.ref_id and store.one('SELECT id FROM entities WHERE id=?', body.ref_id)):
+        raise HTTPException(422, 'A valid entity ref_id is required for an ENTITY card.')
+    if body.kind == 'EVIDENCE' and not (body.ref_id and store.one('SELECT id FROM evidence WHERE id=?', body.ref_id)):
+        raise HTTPException(422, 'A valid evidence ref_id is required for an EVIDENCE card.')
+    try:
+        return store.add_blackboard_item(body.case_id, body.kind, body.title.strip(), body.content.strip(), body.ref_id, body.status, body.x, body.y, body.color, body.created_by.strip())
+    except ValueError as error:
+        raise HTTPException(404, str(error))
+
+@app.patch('/api/blackboard/items/{item_id}')
+def blackboard_item_update(item_id: str, body: BlackboardItemUpdate):
+    if body.status:
+        validate_choice(body.status, BLACKBOARD_STATUSES, 'status')
+    updated = store.update_blackboard_item(item_id, title=body.title, content=body.content, status=body.status, x=body.x, y=body.y, color=body.color)
+    if not updated:
+        raise HTTPException(404, 'Blackboard item not found')
+    return updated
+
+@app.delete('/api/blackboard/items/{item_id}')
+def blackboard_item_delete(item_id: str):
+    if not store.delete_blackboard_item(item_id):
+        raise HTTPException(404, 'Blackboard item not found')
+    return {'deleted': item_id}
+
+@app.post('/api/blackboard/connections')
+def blackboard_connection_create(body: BlackboardConnectionCreate):
+    if body.from_id == body.to_id:
+        raise HTTPException(422, 'Cannot connect a card to itself.')
+    try:
+        return store.add_blackboard_connection(body.case_id, body.from_id, body.to_id, body.label.strip())
+    except ValueError as error:
+        raise HTTPException(404, str(error))
+
+@app.delete('/api/blackboard/connections/{connection_id}')
+def blackboard_connection_delete(connection_id: str):
+    if not store.delete_blackboard_connection(connection_id):
+        raise HTTPException(404, 'Connection not found')
+    return {'deleted': connection_id}
+
 @app.get('/api/dashboard')
 def dashboard(case_id:str='CASE-SL-01'):
     selected=store.one('SELECT * FROM cases WHERE id=?',case_id)
@@ -391,6 +474,24 @@ def job(job_id:str):
     x['result']=json.loads(x['result']); return x
 def question_entities(question):
     q=question.lower(); return [x for x in store.enrich(store.query('SELECT * FROM entities')) if x['label'].lower() in q or x['id'].lower() in q]
+def _confidence_score(rel, docs, alerts, matched):
+    """Deterministic 0-100 score computed only from what was actually retrieved. Never a probability of guilt."""
+    score=min(len(rel),4)*15 + min(len(docs),4)*10 + min(len(alerts),3)*8 + (10 if len(matched)>=2 else 0)
+    return max(5, min(score, 97))
+def _confidence_label(score):
+    return 'HIGH' if score>=70 else 'MEDIUM' if score>=40 else 'LOW'
+def _evidence_gaps(rel, docs, alerts, matched):
+    gaps=[]
+    if len(matched)>=2 and not rel: gaps.append('No confirmed graph relationship links the named entities; only indirect evidence, if any, was found.')
+    if not docs: gaps.append('No source evidence document text was retrieved for this question.')
+    if matched and not alerts: gaps.append('No anomaly or risk signal is currently linked to the matched entities.')
+    return gaps
+def _next_step(rel, docs, alerts, gaps):
+    if not rel and not docs and not alerts: return 'Ingest additional evidence mentioning these entities, then re-ask this question.'
+    if rel and not alerts: return 'Review the linked relationship evidence in Network Explorer and check whether either entity also appears in an anomaly.'
+    if alerts and not rel: return 'Open the linked anomaly in Anomaly & Risk Analysis to review its contributing evidence.'
+    if docs and not rel and not alerts: return 'Open the cited evidence in Evidence & Reports to verify the source and provenance.'
+    return 'Cross-check the cited evidence IDs against the entity dossier before including this finding in a report.'
 def answer(question, case_id='CASE-SL-01'):
     docs=store.retrieve(question, case_id); matched=[x for x in question_entities(question) if x.get('case_id') == case_id]; rel=[]
     if len(matched)>=2: rel=path(matched[0]['id'],matched[1]['id'])['relationships']
@@ -398,10 +499,18 @@ def answer(question, case_id='CASE-SL-01'):
     sources=list(dict.fromkeys([d['id'] for d in docs]+[r['evidence_id'] for r in rel if r.get('evidence_id')]+[evidence for alert in alerts for evidence in alert.get('evidence',[])]))
     entity_ids=list(dict.fromkeys([entity['id'] for entity in matched]+[entity for doc in docs for entity in doc.get('entities',[])]+[entity for relationship in rel for entity in (relationship['source'],relationship['target'])]))
     observed=[f"{r['type']}: {r['source']} → {r['target']} at {r['timestamp']} (evidence {r['evidence_id']})." for r in rel]+[f"{d['source']}: {d['extracted_text'][:180]}" for d in docs[:3]]+[f"{alert['type']}: {alert['explanation']} (evidence {', '.join(alert.get('evidence',[]))})." for alert in alerts[:3]]
+    gaps=_evidence_gaps(rel, docs, alerts, matched)
     if not observed:
-        return {'provider':'deterministic-retrieval','finding':'No sufficiently relevant observed evidence was retrieved for this question.','observed_evidence':[],'inference':'The available case data is insufficient to answer this question. No inference is made.','confidence':'LOW','sources':[],'evidence_ids':[],'entity_ids':entity_ids}
+        return {'provider':'deterministic-retrieval','finding':'No sufficiently relevant observed evidence was retrieved for this question.','observed_evidence':[],'inference':'The available case data is insufficient to answer this question. No inference is made.','confidence':'LOW','confidence_score':5,'why':['No stored evidence, graph relationship, or anomaly matched the terms in this question.'],'next_step':'Ingest evidence mentioning these entities, or rephrase using an exact entity ID or name shown in the case.','evidence_gaps':['No matching evidence, relationships, or anomalies exist yet for this question.'],'sources':[],'evidence_ids':[],'entity_ids':entity_ids}
     finding=f"Retrieved {len(observed)} evidence-backed observation(s)." if not rel else f"{len(rel)} observed graph relationship(s) connect the identified entities."
-    confidence='HIGH' if rel else 'MEDIUM'
+    score=_confidence_score(rel, docs, alerts, matched)
+    confidence=_confidence_label(score)
+    why=[]
+    if matched: why.append(f"Matched {len(matched)} named entity/entities in the question: {', '.join(x['id'] for x in matched)}.")
+    if rel: why.append(f"Found {len(rel)} confirmed graph relationship(s) directly linking the matched entities.")
+    if docs: why.append(f"Retrieved {len(docs)} evidence document(s) whose text contains terms from the question.")
+    if alerts: why.append(f"Linked {len(alerts)} anomaly/risk signal(s) involving the matched entities.")
+    why.append(f"Confidence score {score}/100 reflects only what is directly observed above; it is not a probability of guilt.")
     provider='deterministic-retrieval'
     if config.groq_enabled():
         try:
@@ -409,8 +518,7 @@ def answer(question, case_id='CASE-SL-01'):
             provider='groq-llm'
         except Exception as error:
             finding=f"{finding} (LLM answer unavailable: {error})"
-    return {'provider':provider,'finding':finding,'observed_evidence':observed,'inference':'The retrieved records may indicate an association for investigator review; they do not establish guilt or legal responsibility.','confidence':confidence,'sources':sources,'evidence_ids':sources,'entity_ids':entity_ids}
-@app.post('/api/assistant/query')
+    return {'provider':provider,'finding':finding,'observed_evidence':observed,'inference':'The retrieved records may indicate an association for investigator review; they do not establish guilt or legal responsibility.','confidence':confidence,'confidence_score':score,'why':why,'next_step':_next_step(rel, docs, alerts, gaps),'evidence_gaps':gaps,'sources':sources,'evidence_ids':sources,'entity_ids':entity_ids}@app.post('/api/assistant/query')
 @app.post('/api/assistant')
 def assistant(payload:dict): return answer(payload.get('question',''), payload.get('case_id','CASE-SL-01'))
 @app.post('/api/reports/generate')

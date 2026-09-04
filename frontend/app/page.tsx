@@ -1,5 +1,5 @@
 'use client';
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import dynamic from 'next/dynamic';
 import { usePathname, useRouter } from 'next/navigation';
 import Link from 'next/link';
@@ -11,7 +11,7 @@ const NetworkGraph3D = dynamic(() => import('./components/NetworkGraph3D'), {
 });
 
 const API = process.env.NEXT_PUBLIC_API_URL ?? '';
-const nav = ['Command Center', 'Case Management', 'Intelligence Ingestion', 'Network Explorer', 'Entity Intelligence', 'Anomaly & Risk', 'Investigation Timeline', 'AI Investigation Assistant', 'Evidence & Reports'];
+const nav = ['Command Center', 'Case Management', 'Intelligence Ingestion', 'Network Explorer', 'Entity Intelligence', 'Anomaly & Risk', 'Investigation Timeline', 'AI Investigation Assistant', 'Evidence & Reports', 'Case Workspace'];
 type Any = any;
 const get = (p: string) => fetch(API + p).then(async (r) => { if (!r.ok) throw new Error(`API ${r.status}: ${await r.text()}`); return r.json(); });
 
@@ -389,16 +389,17 @@ function Timeline({ data, entities, anomalies }: Any) {
   );
 }
 
-function Assistant({ selectedCaseId }: { selectedCaseId: string }) {
+function Assistant({ selectedCaseId, onOpenEvidence }: { selectedCaseId: string; onOpenEvidence: (id: string) => void }) {
   const examples = ['How are P-017 and P-003 connected?', 'What does E-001 say about Aarav Sen?', 'What risk signals involve BA-003?', 'What is known about P-017?'];
-  const [q, setQ] = useState(examples[0]), [a, setA] = useState<Any>(), [busy, setBusy] = useState(false), [error, setError] = useState('');
+  const [q, setQ] = useState(examples[0]), [a, setA] = useState<Any>(), [busy, setBusy] = useState(false), [error, setError] = useState(''), [showWhy, setShowWhy] = useState(false);
   function investigate() {
     if (!q.trim() || busy) return;
-    setBusy(true); setError('');
+    setBusy(true); setError(''); setShowWhy(false);
     fetch(API + '/api/assistant/query', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ question: q, case_id: selectedCaseId }) })
       .then(async (response) => { const result = await response.json(); if (!response.ok) throw new Error(result.detail || 'Investigation failed'); return result; })
       .then(setA).catch((reason) => setError(reason instanceof Error ? reason.message : 'Investigation failed')).finally(() => setBusy(false));
   }
+  const evidenceCites: string[] = a?.evidence_ids || a?.sources || [];
   return (
     <>
       <header><div><p className="eyebrow">EVIDENCE-BACKED COPILOT</p><h1>AI Investigation Assistant</h1><p>Every response is grounded in stored graph and evidence records{a ? (a.provider === 'groq-llm' ? ' and phrased by an LLM.' : '.') : '.'}</p></div></header>
@@ -411,24 +412,39 @@ function Assistant({ selectedCaseId }: { selectedCaseId: string }) {
           <Card title="Finding">
             <Badge>{a.provider === 'groq-llm' ? 'LLM-ANSWERED' : 'DETERMINISTIC RETRIEVAL'}</Badge>
             <h2>{a.finding}</h2>
-            <h4>OBSERVED EVIDENCE</h4>{a.observed_evidence.map((x: string, i: number) => <p key={i}>{x}</p>)}
-            <h4>INFERENCE</h4><p>{a.inference}</p>
-            <h4>CONFIDENCE</h4><Badge>{a.confidence}</Badge>
-            <h4>SUPPORTING EVIDENCE IDS</h4><p>{(a.evidence_ids || a.sources || []).length ? (a.evidence_ids || a.sources).map((x: string) => <Badge key={x}>{x}</Badge>) : 'No evidence IDs were retrieved.'}</p>
+            <h4>SUPPORTING EVIDENCE</h4>{a.observed_evidence.map((x: string, i: number) => <p key={i}>{x}</p>)}
+            <h4>SUPPORTING EVIDENCE IDS (click to open)</h4>
+            <p>{evidenceCites.length ? evidenceCites.map((x: string) => <button key={x} className="example-question citation-chip" onClick={() => onOpenEvidence(x)}>{x}</button>) : 'No evidence IDs were retrieved.'}</p>
             <h4>SUPPORTING ENTITY IDS</h4><p>{a.entity_ids?.length ? a.entity_ids.map((x: string) => <Badge key={x}>{x}</Badge>) : 'No entity IDs were retrieved.'}</p>
+            <h4>INFERENCE (labelled — not a fact)</h4><p>{a.inference}</p>
+            <h4>CONFIDENCE</h4>
+            <div className="row"><Badge>{a.confidence}</Badge>{typeof a.confidence_score === 'number' && <div className="confidence-bar" aria-label={`Confidence ${a.confidence_score} of 100`}><div className="confidence-bar-fill" style={{ width: `${a.confidence_score}%` }} /><small>{a.confidence_score}/100</small></div>}</div>
+            {a.why?.length > 0 && (
+              <>
+                <button className="example-question" onClick={() => setShowWhy(!showWhy)}>{showWhy ? 'Hide' : 'Why did you say this?'}</button>
+                {showWhy && <ul className="why-list">{a.why.map((line: string, i: number) => <li key={i}>{line}</li>)}</ul>}
+              </>
+            )}
+            {a.evidence_gaps?.length > 0 && (<><h4>WHAT EVIDENCE IS MISSING</h4><ul className="why-list">{a.evidence_gaps.map((line: string, i: number) => <li key={i}>{line}</li>)}</ul></>)}
+            {a.next_step && (<><h4>POSSIBLE NEXT STEP</h4><p>{a.next_step}</p></>)}
           </Card>
         )}
       </div>
     </>
   );
 }
-function Evidence({ data }: Any) {
+function Evidence({ data, focusId }: Any) {
   const [report, setReport] = useState<Any>();
   const [reportBusy, setReportBusy] = useState(false);
   const [reportError, setReportError] = useState('');
   const [selected, setSelected] = useState<Any>();
   const [selectedDetails, setSelectedDetails] = useState<Any[]>([]);
   const [selectedCase, setSelectedCase] = useState<Any>();
+  useEffect(() => {
+    if (!focusId) return;
+    const item = data.find((x: Any) => x.id === focusId);
+    if (item) selectEvidence(item);
+  }, [focusId, data]);
   async function generateReport() {
     if (reportBusy) return;
     setReportBusy(true);
@@ -562,6 +578,7 @@ function DashboardApp() {
   const [search, setSearch] = useState('');
   const [searchResults, setSearchResults] = useState<Any[]>([]);
   const [selectedEntityId, setSelectedEntityId] = useState('');
+  const [focusEvidenceId, setFocusEvidenceId] = useState('');
   const [user, setUser] = useState<Any>();
   const [cases, setCases] = useState<Any[]>([]);
   const [selectedCaseId, setSelectedCaseId] = useState('CASE-SL-01');
@@ -598,6 +615,7 @@ function DashboardApp() {
   }, [search]);
   function signOut() { localStorage.removeItem('shadowintel-token'); router.replace('/login'); }
   function openEntity(entity: Any) { setSelectedEntityId(entity.id); setPage(nav[4]); setSearch(''); setSearchResults([]); }
+  function openEvidence(id: string) { setFocusEvidenceId(id); setPage(nav[8]); }
   const body =
     page === nav[0] ? <Dashboard d={dash} graph={graph} theme={theme} error={error} /> :
     page === nav[1] ? <CaseManagement onCaseChanged={() => get('/api/cases').then((result) => setCases(result.cases)).catch(() => {})} onUploadCase={(caseId) => { setSelectedCaseId(caseId); setPage(nav[2]); }} /> :
@@ -606,9 +624,9 @@ function DashboardApp() {
     page === nav[4] ? <EnhancedEntity entities={entities} selectedId={selectedEntityId} /> :
     page === nav[5] ? <HybridAnomalies data={anoms} /> :
     page === nav[6] ? <Timeline data={timeline} entities={entities} anomalies={anoms} /> :
-    page === nav[7] ? <Assistant selectedCaseId={selectedCaseId} /> :
+    page === nav[7] ? <Assistant selectedCaseId={selectedCaseId} onOpenEvidence={openEvidence} /> :
     page === 'Settings' ? <Settings theme={theme} onChange={setTheme} user={user} /> :
-    <Evidence data={evidence} />;
+    <Evidence data={evidence} focusId={focusEvidenceId} />;
   if (!authenticated) return <div className="loading">Verifying secure workspace access…</div>;
   return (
     <main className={sidebarOpen ? '' : 'sidebar-hidden'}>

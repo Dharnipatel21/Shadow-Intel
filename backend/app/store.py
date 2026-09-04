@@ -281,3 +281,40 @@ def retrieve(question, case_id=CASE['id']):
         corpus=(e['source']+' '+e['extracted_text']).lower(); score=sum(t in corpus for t in tokens)
         if score: scored.append((score,e))
     return [e for _,e in sorted(scored,key=lambda x:x[0],reverse=True)[:6]]
+def list_blackboard(case_id):
+    """Live corkboard for a case: pinned entities/evidence, notes, and hypotheses plus the strings connecting them."""
+    items=query('SELECT * FROM blackboard_items WHERE case_id=? ORDER BY created_at', case_id)
+    connections=query('SELECT * FROM blackboard_connections WHERE case_id=? ORDER BY created_at', case_id)
+    return {'items':items,'connections':connections}
+def add_blackboard_item(case_id, kind, title, content='', ref_id=None, status='', x=40.0, y=40.0, color='amber', created_by=''):
+    if not one('SELECT id FROM cases WHERE id=?', case_id): raise ValueError('Case not found')
+    item_id=next_id('BB-','blackboard_items'); timestamp=now()
+    c=conn(); c.execute('INSERT INTO blackboard_items VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',
+        (item_id,case_id,kind,ref_id,title,content,status,x,y,color,created_by,timestamp,timestamp)); c.commit(); c.close()
+    return one('SELECT * FROM blackboard_items WHERE id=?', item_id)
+def update_blackboard_item(item_id, **fields):
+    existing=one('SELECT * FROM blackboard_items WHERE id=?', item_id)
+    if not existing: return None
+    allowed={k:v for k,v in fields.items() if v is not None and k in ('title','content','status','x','y','color')}
+    if not allowed: return existing
+    allowed['updated_at']=now()
+    assignments=', '.join(f'{column}=?' for column in allowed)
+    c=conn(); c.execute(f'UPDATE blackboard_items SET {assignments} WHERE id=?', (*allowed.values(), item_id)); c.commit(); c.close()
+    return one('SELECT * FROM blackboard_items WHERE id=?', item_id)
+def delete_blackboard_item(item_id):
+    if not one('SELECT id FROM blackboard_items WHERE id=?', item_id): return False
+    c=conn()
+    c.execute('DELETE FROM blackboard_connections WHERE from_id=? OR to_id=?', (item_id, item_id))
+    c.execute('DELETE FROM blackboard_items WHERE id=?', (item_id,))
+    c.commit(); c.close()
+    return True
+def add_blackboard_connection(case_id, from_id, to_id, label=''):
+    if not one('SELECT id FROM blackboard_items WHERE id=? AND case_id=?', from_id, case_id): raise ValueError('Source card not found in this case')
+    if not one('SELECT id FROM blackboard_items WHERE id=? AND case_id=?', to_id, case_id): raise ValueError('Target card not found in this case')
+    connection_id=next_id('BC-','blackboard_connections'); timestamp=now()
+    c=conn(); c.execute('INSERT INTO blackboard_connections VALUES(?,?,?,?,?,?)', (connection_id,case_id,from_id,to_id,label,timestamp)); c.commit(); c.close()
+    return one('SELECT * FROM blackboard_connections WHERE id=?', connection_id)
+def delete_blackboard_connection(connection_id):
+    if not one('SELECT id FROM blackboard_connections WHERE id=?', connection_id): return False
+    c=conn(); c.execute('DELETE FROM blackboard_connections WHERE id=?', (connection_id,)); c.commit(); c.close()
+    return True
