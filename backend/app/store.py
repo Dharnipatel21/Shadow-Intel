@@ -40,10 +40,11 @@ def init(force=False):
     CREATE TABLE IF NOT EXISTS cases(id TEXT PRIMARY KEY,name TEXT,status TEXT,disclaimer TEXT);
     CREATE TABLE IF NOT EXISTS entities(id TEXT PRIMARY KEY,label TEXT,type TEXT,aliases TEXT,confidence REAL,case_id TEXT,created_at TEXT);
     CREATE TABLE IF NOT EXISTS relationships(id TEXT PRIMARY KEY,source TEXT,target TEXT,type TEXT,timestamp TEXT,confidence REAL,evidence_id TEXT,provenance TEXT);
-    CREATE TABLE IF NOT EXISTS evidence(id TEXT PRIMARY KEY,source TEXT,document_type TEXT,created_at TEXT,hash TEXT,path TEXT,extracted_text TEXT,entities TEXT,audit TEXT,case_id TEXT);
+    CREATE TABLE IF NOT EXISTS evidence(id TEXT PRIMARY KEY,source TEXT,document_type TEXT,created_at TEXT,hash TEXT,path TEXT,extracted_text TEXT,entities TEXT,audit TEXT,case_id TEXT,language TEXT DEFAULT 'English');
     CREATE TABLE IF NOT EXISTS events(id TEXT PRIMARY KEY,type TEXT,timestamp TEXT,title TEXT,entities TEXT,amount REAL,source TEXT,confidence REAL);
     CREATE TABLE IF NOT EXISTS jobs(id TEXT PRIMARY KEY,source TEXT,status TEXT,created_at TEXT,result TEXT,case_id TEXT);
     CREATE TABLE IF NOT EXISTS reports(id TEXT PRIMARY KEY,created_at TEXT,content TEXT);
+    CREATE TABLE IF NOT EXISTS assistant_messages(id TEXT PRIMARY KEY,case_id TEXT NOT NULL,question TEXT NOT NULL,answer TEXT NOT NULL,language TEXT NOT NULL,created_at TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS blackboard_items(
         id TEXT PRIMARY KEY,case_id TEXT NOT NULL,kind TEXT NOT NULL,ref_id TEXT,title TEXT NOT NULL,
         content TEXT,status TEXT,x REAL NOT NULL,y REAL NOT NULL,color TEXT,created_by TEXT,
@@ -58,6 +59,8 @@ def init(force=False):
     for table in ('evidence', 'jobs'):
         columns={row[1] for row in c.execute(f'PRAGMA table_info({table})').fetchall()}
         if 'case_id' not in columns: c.execute(f'ALTER TABLE {table} ADD COLUMN case_id TEXT')
+    evidence_columns={row[1] for row in c.execute('PRAGMA table_info(evidence)').fetchall()}
+    if 'language' not in evidence_columns: c.execute("ALTER TABLE evidence ADD COLUMN language TEXT DEFAULT 'English'")
     c.execute('UPDATE evidence SET case_id=? WHERE case_id IS NULL', (CASE['id'],))
     c.execute('UPDATE jobs SET case_id=? WHERE case_id IS NULL', (CASE['id'],))
     c.commit()
@@ -71,7 +74,7 @@ def init(force=False):
     for e in DATA['evidence']:
         text=e['preview']; path=EVIDENCE_DIR/f"{e['id']}.txt"; path.write_text(text,encoding='utf-8')
         digest=hashlib.sha256(path.read_bytes()).hexdigest()
-        c.execute('INSERT INTO evidence VALUES(?,?,?,?,?,?,?,?,?,?)',(e['id'],e['source'],e['document_type'],e['created_at'],digest,str(path),text,json.dumps(e.get('entities',[])),json.dumps(e.get('audit',[])),CASE['id']))
+        c.execute('INSERT INTO evidence(id,source,document_type,created_at,hash,path,extracted_text,entities,audit,case_id,language) VALUES(?,?,?,?,?,?,?,?,?,?,?)',(e['id'],e['source'],e['document_type'],e['created_at'],digest,str(path),text,json.dumps(e.get('entities',[])),json.dumps(e.get('audit',[])),CASE['id'],'English'))
     for e in DATA['events']:
         c.execute('INSERT INTO events VALUES(?,?,?,?,?,?,?,?)',(e['id'],e['type'],e['timestamp'],e['title'],json.dumps(e['entities']),e.get('amount'),e['source'],e['confidence']))
     c.commit(); c.close()
@@ -224,7 +227,7 @@ def next_id(prefix, table):
     ids=query(f"SELECT id FROM {table} WHERE id LIKE ?",prefix+'%')
     highest=max((int(row['id'].rsplit('-',1)[-1]) for row in ids if row['id'].rsplit('-',1)[-1].isdigit()),default=0)
     return f"{prefix}{highest+1:03}"
-def add_upload(filename, raw, text, document_type='Uploaded document', extraction_method='plain text', extracted=None, structured_extraction=None, warnings=None, case_id=CASE['id']):
+def add_upload(filename, raw, text, document_type='Uploaded document', extraction_method='plain text', extracted=None, structured_extraction=None, warnings=None, case_id=CASE['id'], language='English'):
     c=conn()
     try:
         if not one('SELECT id FROM cases WHERE id=?', case_id): raise ValueError('Case not found')
@@ -242,7 +245,7 @@ def add_upload(filename, raw, text, document_type='Uploaded document', extractio
                 eid=next_id(prefix,'entities'); c.execute('INSERT INTO entities VALUES(?,?,?,?,?,?,?)',(eid,label,typ,'[]',.99,case_id,now())); c.commit()
             ids.append(eid); resolutions.append({"mention":label,"entity_id":eid,"confidence":score or .99})
         doc=next_id('DOC-','entities'); c.execute('INSERT INTO entities VALUES(?,?,?,?,?,?,?)',(doc,filename,'Document','[]',1,case_id,now())); c.commit()
-        c.execute('INSERT INTO evidence VALUES(?,?,?,?,?,?,?,?,?,?)',(evidence_id,filename,document_type,now(),digest,str(path),text,json.dumps(ids),json.dumps(['uploaded','text extracted','entities resolved']),case_id))
+        c.execute('INSERT INTO evidence(id,source,document_type,created_at,hash,path,extracted_text,entities,audit,case_id,language) VALUES(?,?,?,?,?,?,?,?,?,?,?)',(evidence_id,filename,document_type,now(),digest,str(path),text,json.dumps(ids),json.dumps(['uploaded','text extracted','entities resolved',f'language detected: {language}']),case_id,language))
         rels=0
         for eid in set(ids):
             rid=next_id('R-','relationships'); c.execute('INSERT INTO relationships VALUES(?,?,?,?,?,?,?,?)',(rid,eid,doc,'MENTIONED_IN',now(),.84,evidence_id,'upload extraction')); c.commit(); rels+=1
@@ -298,11 +301,12 @@ def _ensure_blackboard_schema():
     ''')
     c.commit(); c.close()
 def retrieve(question, case_id=CASE['id']):
-    tokens={x.lower() for x in re.findall(r'[a-zA-Z0-9-]{3,}',question)}
+    # Keep Unicode words intact so retrieval works for every supported script.
+    tokens={x.casefold() for x in re.findall(r'[\w-]{2,}',question,flags=re.UNICODE)}
     evidence=query('SELECT * FROM evidence WHERE case_id=?', case_id)
     scored=[]
     for e in evidence:
-        corpus=(e['source']+' '+e['extracted_text']).lower(); score=sum(t in corpus for t in tokens)
+        corpus=(e['source']+' '+e['extracted_text']).casefold(); score=sum(t in corpus for t in tokens)
         if score: scored.append((score,e))
     return [e for _,e in sorted(scored,key=lambda x:x[0],reverse=True)[:6]]
 def list_blackboard(case_id):
@@ -343,3 +347,14 @@ def delete_blackboard_connection(connection_id):
     if not one('SELECT id FROM blackboard_connections WHERE id=?', connection_id): return False
     c=conn(); c.execute('DELETE FROM blackboard_connections WHERE id=?', (connection_id,)); c.commit(); c.close()
     return True
+
+def add_assistant_message(case_id, question, answer, language):
+    if not one('SELECT id FROM cases WHERE id=?', case_id): raise ValueError('Case not found')
+    message_id=next_id('CHAT-', 'assistant_messages'); timestamp=now()
+    c=conn(); c.execute('INSERT INTO assistant_messages VALUES(?,?,?,?,?,?)', (message_id,case_id,question,json.dumps(answer),language,timestamp)); c.commit(); c.close()
+    return one('SELECT * FROM assistant_messages WHERE id=?', message_id)
+
+def list_assistant_messages(case_id):
+    items=query('SELECT * FROM assistant_messages WHERE case_id=? ORDER BY created_at ASC', case_id)
+    for item in items: item['answer']=json.loads(item['answer'])
+    return items

@@ -391,13 +391,14 @@ function Timeline({ data, entities, anomalies }: Any) {
 
 function Assistant({ selectedCaseId, onOpenEvidence }: { selectedCaseId: string; onOpenEvidence: (id: string) => void }) {
   const examples = ['How are P-017 and P-003 connected?', 'What does E-001 say about Aarav Sen?', 'What risk signals involve BA-003?', 'What is known about P-017?'];
-  const [q, setQ] = useState(examples[0]), [a, setA] = useState<Any>(), [busy, setBusy] = useState(false), [error, setError] = useState(''), [showWhy, setShowWhy] = useState(false);
+  const [q, setQ] = useState(examples[0]), [a, setA] = useState<Any>(), [history, setHistory] = useState<Any[]>([]), [busy, setBusy] = useState(false), [error, setError] = useState(''), [showWhy, setShowWhy] = useState(false);
+  useEffect(() => { setA(undefined); get('/api/assistant/history?case_id=' + encodeURIComponent(selectedCaseId)).then(setHistory).catch(() => setHistory([])); }, [selectedCaseId]);
   function investigate() {
     if (!q.trim() || busy) return;
     setBusy(true); setError(''); setShowWhy(false);
     fetch(API + '/api/assistant/query', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ question: q, case_id: selectedCaseId }) })
       .then(async (response) => { const result = await response.json(); if (!response.ok) throw new Error(result.detail || 'Investigation failed'); return result; })
-      .then(setA).catch((reason) => setError(reason instanceof Error ? reason.message : 'Investigation failed')).finally(() => setBusy(false));
+      .then((result) => { setA(result); setHistory((items) => [...items, { id: crypto.randomUUID(), question: q, answer: result, language: result.language, created_at: new Date().toISOString() }]); }).catch((reason) => setError(reason instanceof Error ? reason.message : 'Investigation failed')).finally(() => setBusy(false));
   }
   const evidenceCites: string[] = a?.evidence_ids || a?.sources || [];
   return (
@@ -408,6 +409,7 @@ function Assistant({ selectedCaseId, onOpenEvidence }: { selectedCaseId: string;
         <div className="assistant-examples" aria-label="Example questions">{examples.map((example) => <button key={example} className="example-question" onClick={() => setQ(example)}>{example}</button>)}</div>
         <button onClick={investigate} disabled={busy || !q.trim()}>{busy ? 'Retrieving…' : 'Investigate'}</button>
         {error && <p className="notice">{error}</p>}
+        {history.length > 0 && <Card title="Saved investigation history">{history.slice().reverse().map((item: Any) => <div className="row" key={item.id}><button className="example-question" onClick={() => { setQ(item.question); setA(item.answer); }}><b>{item.question}</b><small>{item.language} · {new Date(item.created_at).toLocaleString()}</small></button></div>)}</Card>}
         {a && (
           <Card title="Finding">
             <Badge>{a.provider === 'groq-llm' ? 'LLM-ANSWERED' : 'DETERMINISTIC RETRIEVAL'}</Badge>

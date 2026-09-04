@@ -2,6 +2,7 @@
 from __future__ import annotations
 import json
 import re
+import unicodedata
 from . import config
 
 SYSTEM_PROMPT = (
@@ -13,7 +14,7 @@ SYSTEM_PROMPT = (
     "Keep the answer concise (3-6 sentences)."
 )
 
-def generate(question: str, observed_evidence: list[str]) -> str:
+def generate(question: str, observed_evidence: list[str], response_language: str = 'English') -> str:
     from groq import Groq
 
     client = Groq(api_key=config.GROQ_API_KEY)
@@ -21,7 +22,7 @@ def generate(question: str, observed_evidence: list[str]) -> str:
     completion = client.chat.completions.create(
         model=config.GROQ_MODEL,
         messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": SYSTEM_PROMPT + f" Reply in {response_language}, preserving evidence IDs and source wording where quoted."},
             {"role": "user", "content": f"Question: {question}\n\nOBSERVED EVIDENCE:\n{evidence_block}"},
         ],
         temperature=0.2,
@@ -45,7 +46,7 @@ Return strict JSON with exactly these keys:
 Use empty arrays when a category is absent. Do not infer, normalize, resolve, summarize, or add facts. Every value must be copied from SOURCE TEXT; relationship and transaction endpoints must be copied entity/identifier text from SOURCE TEXT."""
 
 def _normalized(value: str) -> str:
-    return re.sub(r'[^a-z0-9]', '', value.casefold())
+    return ''.join(character for character in value.casefold() if character.isalnum())
 
 def _supported(value: str, source: str) -> bool:
     value_norm=_normalized(value)
@@ -61,7 +62,7 @@ def _valid_entity_name(name: str, entity_type: str, source: str) -> bool:
     if not 1 <= len(words) <= 5 or any(not word.strip('()[],-').strip() for word in words):
         return False
     if entity_type == 'PERSON':
-        if not 2 <= len(words) <= 4 or any(not re.fullmatch(r"[A-Za-z][A-Za-z'’-]*", word) for word in words):
+        if not 2 <= len(words) <= 4 or any(not all(character.isalpha() or unicodedata.category(character).startswith('M') or character in "'’-" for character in word) for word in words):
             return False
         return not any(word.casefold() in PERSON_STOPWORDS for word in words)
     if entity_type in {'PHONE', 'ACCOUNT', 'DATE'}:

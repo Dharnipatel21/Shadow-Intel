@@ -7,7 +7,7 @@ from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Query, Reque
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from . import store, auth, config, llm, export, data
+from . import store, auth, config, llm, export, data, language
 
 app=FastAPI(title='ShadowIntel API',version='2.0')
 app.add_middleware(CORSMiddleware,allow_origins=['http://localhost:3000','http://127.0.0.1:3000'],allow_origin_regex=r'^https?://(localhost|127\.0\.0\.1|192\.168\.\d{1,3}\.\d{1,3})(:\d+)?$',allow_methods=['*'],allow_headers=['*'])
@@ -402,7 +402,8 @@ def ocr_image(image):
     try:
         import pytesseract
         pytesseract.pytesseract.tesseract_cmd=binary
-        return pytesseract.image_to_string(image)
+        available=pytesseract.get_languages(config='')
+        return pytesseract.image_to_string(image, lang=language.ocr_languages(available))
     except Exception as e:
         raise HTTPException(422,f'Image OCR unavailable: {e}')
 def document_text(file,raw):
@@ -411,7 +412,7 @@ def document_text(file,raw):
         try:
             from PIL import Image
             import io
-            return ocr_image(Image.open(io.BytesIO(raw))),'OCR'
+            text=ocr_image(Image.open(io.BytesIO(raw))); return text,'OCR',language.language_name(language.detect_language(text))
         except HTTPException: raise
         except Exception as e: raise HTTPException(422,f'Image could not be decoded for OCR: {e}')
     if suffix=='.pdf':
@@ -419,16 +420,16 @@ def document_text(file,raw):
             import io, pdfplumber
             with pdfplumber.open(io.BytesIO(raw)) as pdf:
                 pages=list(pdf.pages); text='\n'.join(page.extract_text() or '' for page in pages).strip()
-                if text: return text,'PDF text'
+                if text: return text,'PDF text',language.language_name(language.detect_language(text))
                 # Scanned PDF: render each page then send it through the exact same OCR service.
                 rendered=[page.to_image(resolution=200).original for page in pages]
             text='\n'.join(ocr_image(image) for image in rendered).strip()
             if not text: raise HTTPException(422,'Scanned PDF OCR completed but no readable text was found.')
-            return text,'OCR'
+            return text,'OCR',language.language_name(language.detect_language(text))
         except HTTPException: raise
         except ImportError: raise HTTPException(422,'PDF extraction requires pdfplumber. Install backend requirements with python -m pip install -r requirements.txt.')
         except Exception as e: raise HTTPException(422,f'PDF text extraction failed: {e}')
-    return raw.decode('utf-8','ignore'),'plain text'
+    text=raw.decode('utf-8','ignore'); return text,'plain text',language.language_name(language.detect_language(text))
 def youtube_video_id(url):
     parsed=urlparse(url)
     if parsed.netloc in {'youtu.be','www.youtu.be'}: return parsed.path.strip('/').split('/')[0]
@@ -453,10 +454,10 @@ async def ingest(file:UploadFile|None=File(None), url:str|None=Form(None), case_
     began=perf_counter(); raw=await file.read() if file else b''
     if url:
         if file: raise HTTPException(422,'Provide either a file or a YouTube URL, not both.')
-        text,video_id=youtube_text(url); raw=text.encode('utf-8'); result=store.add_upload(f'youtube_{video_id}.txt',raw,text,'YouTube transcript','transcript',case_id=case_id)
+        text,video_id=youtube_text(url); raw=text.encode('utf-8'); detected_language=language.language_name(language.detect_language(text)); result=store.add_upload(f'youtube_{video_id}.txt',raw,text,'YouTube transcript','transcript',case_id=case_id,language=detected_language)
     else:
         if not file or not raw: raise HTTPException(422,'Provide a non-empty file or a YouTube URL.')
-        text,method=document_text(file,raw)
+        text,method,detected_language=document_text(file,raw)
         suffix=Path(file.filename or '').suffix.lower()
         extracted=store.extract(text); structured=extracted; extraction_method=method; warnings=[]
         if suffix in {'.txt','.pdf'} and method in {'plain text','PDF text'}:
@@ -467,10 +468,10 @@ async def ingest(file:UploadFile|None=File(None), url:str|None=Form(None), case_
             except Exception as error:
                 warnings.append(f'LLM extraction unavailable or failed validation; deterministic extraction used: {error}')
                 extraction_method=f'{method} (deterministic fallback)'
-        result=store.add_upload(file.filename or 'upload',raw,text,method,extraction_method,extracted=extracted,structured_extraction=structured,warnings=warnings,case_id=case_id)
+        result=store.add_upload(file.filename or 'upload',raw,text,method,extraction_method,extracted=extracted,structured_extraction=structured,warnings=warnings,case_id=case_id,language=detected_language)
     # Real rule-generated result for the final ingestion pipeline stage.
     result['anomaly_count']=len(store.detect_anomalies())
-    result['duration_ms']=round((perf_counter()-began)*1000,2); return result
+    result['language']=detected_language; result['duration_ms']=round((perf_counter()-began)*1000,2); return result
 @app.get('/api/ingestion/jobs')
 def jobs(case_id:str='CASE-SL-01'):
     items=store.query('SELECT * FROM jobs WHERE case_id=? ORDER BY created_at DESC',case_id)
@@ -501,7 +502,26 @@ def _next_step(rel, docs, alerts, gaps):
     if alerts and not rel: return 'Open the linked anomaly in Anomaly & Risk Analysis to review its contributing evidence.'
     if docs and not rel and not alerts: return 'Open the cited evidence in Evidence & Reports to verify the source and provenance.'
     return 'Cross-check the cited evidence IDs against the entity dossier before including this finding in a report.'
+ASSISTANT_COPY={
+    'en':('No sufficiently relevant observed evidence was retrieved for this question.','The available case data is insufficient to answer this question. No inference is made.','Review the cited evidence and entity IDs before acting on this result.'),
+    'hi':('इस प्रश्न के लिए पर्याप्त प्रेक्षित साक्ष्य नहीं मिला।','उपलब्ध केस डेटा इस प्रश्न का उत्तर देने के लिए अपर्याप्त है। कोई निष्कर्ष नहीं निकाला गया है।','इस परिणाम पर कार्रवाई से पहले उद्धृत साक्ष्य और इकाई आईडी की समीक्षा करें।'),
+    'ta':('இந்தக் கேள்விக்குப் போதுமான பதிவுசெய்யப்பட்ட சான்றுகள் கிடைக்கவில்லை.','இந்தக் கேள்விக்குப் பதிலளிக்க கிடைக்கக்கூடிய வழக்குத் தரவு போதுமானதல்ல. எந்த முடிவும் எடுக்கப்படவில்லை.','இந்த முடிவில் நடவடிக்கை எடுப்பதற்கு முன் மேற்கோள் சான்றுகளையும் அலகு ஐடிகளையும் சரிபார்க்கவும்.'),
+    'te':('ఈ ప్రశ్నకు తగిన పరిశీలిత సాక్ష్యం లభించలేదు.','ఈ ప్రశ్నకు సమాధానం ఇవ్వడానికి అందుబాటులో ఉన్న కేసు డేటా సరిపోదు. ఎలాంటి నిర్ధారణ చేయలేదు.','ఈ ఫలితంపై చర్య తీసుకునే ముందు పేర్కొన్న సాక్ష్యం మరియు ఎంటిటీ ఐడీలను సమీక్షించండి.'),
+    'bn':('এই প্রশ্নের জন্য যথেষ্ট পর্যবেক্ষিত প্রমাণ পাওয়া যায়নি।','এই প্রশ্নের উত্তর দেওয়ার জন্য উপলব্ধ মামলার তথ্য যথেষ্ট নয়। কোনো অনুমান করা হয়নি।','এই ফলাফলের ভিত্তিতে পদক্ষেপ নেওয়ার আগে উদ্ধৃত প্রমাণ ও সত্তার আইডি পর্যালোচনা করুন।'),
+    'mr':('या प्रश्नासाठी पुरेसा निरीक्षित पुरावा मिळाला नाही.','या प्रश्नाचे उत्तर देण्यासाठी उपलब्ध प्रकरणातील माहिती अपुरी आहे. कोणताही निष्कर्ष काढलेला नाही.','या निकालावर कारवाई करण्यापूर्वी उद्धृत पुरावे आणि घटक आयडी तपासा.'),
+    'gu':('આ પ્રશ્ન માટે પૂરતા અવલોકિત પુરાવા મળ્યા નથી.','આ પ્રશ્નનો જવાબ આપવા માટે ઉપલબ્ધ કેસ ડેટા અપૂરતો છે. કોઈ અનુમાન કરવામાં આવ્યું નથી.','આ પરિણામ પર કાર્યવાહી કરતા પહેલાં ઉલ્લેખિત પુરાવા અને એન્ટિટી આઈડીની સમીક્ષા કરો.'),
+}
+OBSERVED_COPY={
+    'en': lambda count, relationships: f"Retrieved {count} evidence-backed observation(s)." if not relationships else f"{relationships} observed graph relationship(s) connect the identified entities.",
+    'hi': lambda count, relationships: f"{count} साक्ष्य-आधारित अवलोकन प्राप्त हुए।" if not relationships else f"{relationships} देखे गए ग्राफ संबंध पहचानी गई इकाइयों को जोड़ते हैं।",
+    'ta': lambda count, relationships: f"{count} சான்று அடிப்படையிலான பதிவுகள் கிடைத்தன." if not relationships else f"{relationships} கவனிக்கப்பட்ட வரைபட உறவுகள் அடையாளம் காணப்பட்ட அலகுகளை இணைக்கின்றன.",
+    'te': lambda count, relationships: f"{count} సాక్ష్య ఆధారిత పరిశీలనలు లభించాయి." if not relationships else f"{relationships} పరిశీలించిన గ్రాఫ్ సంబంధాలు గుర్తించిన ఎంటిటీలను కలుపుతున్నాయి.",
+    'bn': lambda count, relationships: f"{count}টি প্রমাণ-ভিত্তিক পর্যবেক্ষণ পাওয়া গেছে।" if not relationships else f"{relationships}টি পর্যবেক্ষিত গ্রাফ সম্পর্ক চিহ্নিত সত্তাগুলিকে সংযুক্ত করে।",
+    'mr': lambda count, relationships: f"{count} पुरावा-आधारित निरीक्षणे मिळाली." if not relationships else f"{relationships} निरीक्षित ग्राफ संबंध ओळखलेल्या घटकांना जोडतात.",
+    'gu': lambda count, relationships: f"{count} પુરાવા આધારિત અવલોકનો મળ્યા." if not relationships else f"{relationships} અવલોકિત ગ્રાફ સંબંધો ઓળખાયેલી એન્ટિટીઓને જોડે છે.",
+}
 def answer(question, case_id='CASE-SL-01'):
+    question_language=language.detect_language(question); response_language=language.language_name(question_language); copy=ASSISTANT_COPY[question_language]
     docs=store.retrieve(question, case_id); matched=[x for x in question_entities(question) if x.get('case_id') == case_id]; rel=[]
     if len(matched)>=2: rel=path(matched[0]['id'],matched[1]['id'])['relationships']
     alerts=[alert for alert in store.detect_anomalies() if any(entity['id'] in alert.get('entities',[]) for entity in matched)]
@@ -510,8 +530,8 @@ def answer(question, case_id='CASE-SL-01'):
     observed=[f"{r['type']}: {r['source']} → {r['target']} at {r['timestamp']} (evidence {r['evidence_id']})." for r in rel]+[f"{d['source']}: {d['extracted_text'][:180]}" for d in docs[:3]]+[f"{alert['type']}: {alert['explanation']} (evidence {', '.join(alert.get('evidence',[]))})." for alert in alerts[:3]]
     gaps=_evidence_gaps(rel, docs, alerts, matched)
     if not observed:
-        return {'provider':'deterministic-retrieval','finding':'No sufficiently relevant observed evidence was retrieved for this question.','observed_evidence':[],'inference':'The available case data is insufficient to answer this question. No inference is made.','confidence':'LOW','confidence_score':5,'why':['No stored evidence, graph relationship, or anomaly matched the terms in this question.'],'next_step':'Ingest evidence mentioning these entities, or rephrase using an exact entity ID or name shown in the case.','evidence_gaps':['No matching evidence, relationships, or anomalies exist yet for this question.'],'sources':[],'evidence_ids':[],'entity_ids':entity_ids}
-    finding=f"Retrieved {len(observed)} evidence-backed observation(s)." if not rel else f"{len(rel)} observed graph relationship(s) connect the identified entities."
+        return {'provider':'deterministic-retrieval','language':response_language,'finding':copy[0],'observed_evidence':[],'inference':copy[1],'confidence':'LOW','confidence_score':5,'why':[copy[0]],'next_step':copy[2],'evidence_gaps':[copy[0]],'sources':[],'evidence_ids':[],'entity_ids':entity_ids}
+    finding=OBSERVED_COPY[question_language](len(observed), len(rel))
     score=_confidence_score(rel, docs, alerts, matched)
     confidence=_confidence_label(score)
     why=[]
@@ -523,13 +543,24 @@ def answer(question, case_id='CASE-SL-01'):
     provider='deterministic-retrieval'
     if config.groq_enabled():
         try:
-            finding=llm.generate(question, observed)
+            finding=llm.generate(question, observed, response_language)
             provider='groq-llm'
         except Exception as error:
             finding=f"{finding} (LLM answer unavailable: {error})"
-    return {'provider':provider,'finding':finding,'observed_evidence':observed,'inference':'The retrieved records may indicate an association for investigator review; they do not establish guilt or legal responsibility.','confidence':confidence,'confidence_score':score,'why':why,'next_step':_next_step(rel, docs, alerts, gaps),'evidence_gaps':gaps,'sources':sources,'evidence_ids':sources,'entity_ids':entity_ids}@app.post('/api/assistant/query')
+    return {'provider':provider,'language':response_language,'finding':finding,'observed_evidence':observed,'inference':copy[1] if question_language!='en' else 'The retrieved records may indicate an association for investigator review; they do not establish guilt or legal responsibility.','confidence':confidence,'confidence_score':score,'why':why,'next_step':copy[2] if question_language!='en' else _next_step(rel, docs, alerts, gaps),'evidence_gaps':gaps,'sources':sources,'evidence_ids':sources,'entity_ids':entity_ids}
+@app.post('/api/assistant/query')
 @app.post('/api/assistant')
-def assistant(payload:dict): return answer(payload.get('question',''), payload.get('case_id','CASE-SL-01'))
+def assistant(payload:dict):
+    case_id=payload.get('case_id','CASE-SL-01'); question=payload.get('question','').strip()
+    if not question: raise HTTPException(422, 'A question is required.')
+    result=answer(question, case_id)
+    try: store.add_assistant_message(case_id, question, result, result['language'])
+    except ValueError as error: raise HTTPException(404, str(error))
+    return result
+@app.get('/api/assistant/history')
+def assistant_history(case_id: str='CASE-SL-01'):
+    if not store.one('SELECT id FROM cases WHERE id=?', case_id): raise HTTPException(404, 'Case not found')
+    return store.list_assistant_messages(case_id)
 @app.post('/api/reports/generate')
 @app.get('/api/report')
 def report():
