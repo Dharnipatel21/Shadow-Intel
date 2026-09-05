@@ -34,10 +34,25 @@ def _migrate_cases_table(c):
     additions={'investigator':"TEXT DEFAULT ''",'priority':"TEXT DEFAULT 'MEDIUM'",'stage':"TEXT DEFAULT 'EVIDENCE_INGESTION'",'created_at':"TEXT DEFAULT ''",'updated_at':"TEXT DEFAULT ''"}
     for column,ddl in additions.items():
         if column not in existing: c.execute(f'ALTER TABLE cases ADD COLUMN {column} {ddl}')
+def _seed_missing(c):
+    timestamp=now()
+    c.execute('INSERT OR IGNORE INTO cases(id,name,status,investigator,priority,stage,disclaimer,created_at,updated_at,owner_id) VALUES(?,?,?,?,?,?,?,?,?,?)',(CASE['id'],CASE['name'],CASE['status'],CASE['investigator'],CASE['priority'],CASE['stage'],CASE['disclaimer'],timestamp,timestamp,None))
+    for n in DATA['nodes']:
+        c.execute('INSERT OR IGNORE INTO entities(id,label,type,aliases,confidence,case_id,created_at) VALUES(?,?,?,?,?,?,?)',(n['id'],n['label'],n['type'],json.dumps(n.get('aliases',[])),n.get('confidence',.8),CASE['id'],timestamp))
+    for e in DATA['edges']:
+        c.execute('INSERT OR IGNORE INTO relationships(id,source,target,type,timestamp,confidence,evidence_id,provenance) VALUES(?,?,?,?,?,?,?,?)',(e['id'],e['source'],e['target'],e['type'],e['timestamp'],e['confidence'],e.get('evidence_id'),'synthetic-generator'))
+    for e in DATA['evidence']:
+        text=e['preview']; path=EVIDENCE_DIR/f"{e['id']}.txt"
+        if not path.exists(): path.write_text(text,encoding='utf-8')
+        digest=hashlib.sha256(path.read_bytes()).hexdigest()
+        c.execute('INSERT OR IGNORE INTO evidence(id,source,document_type,created_at,hash,path,extracted_text,entities,audit,case_id,language,uploader_id,metadata) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',(e['id'],e['source'],e['document_type'],e['created_at'],digest,str(path),text,json.dumps(e.get('entities',[])),json.dumps(e.get('audit',[])),CASE['id'],'English',None,json.dumps({'seed':True})))
+    for e in DATA['events']:
+        c.execute('INSERT OR IGNORE INTO events(id,type,timestamp,title,entities,amount,source,confidence) VALUES(?,?,?,?,?,?,?,?)',(e['id'],e['type'],e['timestamp'],e['title'],json.dumps(e['entities']),e.get('amount'),e['source'],e['confidence']))
 def init(force=False):
     if force and DB.exists(): DB.unlink()
     c=conn(); c.executescript('''
     CREATE TABLE IF NOT EXISTS cases(id TEXT PRIMARY KEY,name TEXT,status TEXT,disclaimer TEXT);
+    CREATE TABLE IF NOT EXISTS case_members(case_id TEXT NOT NULL,user_id TEXT NOT NULL,permission TEXT NOT NULL DEFAULT 'VIEW',created_at TEXT NOT NULL,PRIMARY KEY(case_id,user_id));
     CREATE TABLE IF NOT EXISTS entities(id TEXT PRIMARY KEY,label TEXT,type TEXT,aliases TEXT,confidence REAL,case_id TEXT,created_at TEXT);
     CREATE TABLE IF NOT EXISTS relationships(id TEXT PRIMARY KEY,source TEXT,target TEXT,type TEXT,timestamp TEXT,confidence REAL,evidence_id TEXT,provenance TEXT);
     CREATE TABLE IF NOT EXISTS evidence(id TEXT PRIMARY KEY,source TEXT,document_type TEXT,created_at TEXT,hash TEXT,path TEXT,extracted_text TEXT,entities TEXT,audit TEXT,case_id TEXT,language TEXT DEFAULT 'English');
@@ -56,27 +71,21 @@ def init(force=False):
     );
     ''')
     _migrate_cases_table(c)
+    case_columns={row[1] for row in c.execute('PRAGMA table_info(cases)').fetchall()}
+    if 'owner_id' not in case_columns: c.execute('ALTER TABLE cases ADD COLUMN owner_id TEXT')
     for table in ('evidence', 'jobs'):
         columns={row[1] for row in c.execute(f'PRAGMA table_info({table})').fetchall()}
         if 'case_id' not in columns: c.execute(f'ALTER TABLE {table} ADD COLUMN case_id TEXT')
     evidence_columns={row[1] for row in c.execute('PRAGMA table_info(evidence)').fetchall()}
     if 'language' not in evidence_columns: c.execute("ALTER TABLE evidence ADD COLUMN language TEXT DEFAULT 'English'")
+    if 'uploader_id' not in evidence_columns: c.execute('ALTER TABLE evidence ADD COLUMN uploader_id TEXT')
+    if 'metadata' not in evidence_columns: c.execute("ALTER TABLE evidence ADD COLUMN metadata TEXT DEFAULT '{}'")
+    job_columns={row[1] for row in c.execute('PRAGMA table_info(jobs)').fetchall()}
+    if 'uploader_id' not in job_columns: c.execute('ALTER TABLE jobs ADD COLUMN uploader_id TEXT')
     c.execute('UPDATE evidence SET case_id=? WHERE case_id IS NULL', (CASE['id'],))
     c.execute('UPDATE jobs SET case_id=? WHERE case_id IS NULL', (CASE['id'],))
     c.commit()
-    if c.execute('SELECT count(*) FROM cases').fetchone()[0]: c.close(); return
-    c.execute('INSERT INTO cases(id,name,status,investigator,priority,stage,disclaimer,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)',
-        (CASE['id'],CASE['name'],CASE['status'],CASE['investigator'],CASE['priority'],CASE['stage'],CASE['disclaimer'],now(),now()))
-    for n in DATA['nodes']:
-        c.execute('INSERT INTO entities VALUES(?,?,?,?,?,?,?)',(n['id'],n['label'],n['type'],json.dumps(n.get('aliases',[])),n.get('confidence',.8),CASE['id'],now()))
-    for e in DATA['edges']:
-        c.execute('INSERT INTO relationships VALUES(?,?,?,?,?,?,?,?)',(e['id'],e['source'],e['target'],e['type'],e['timestamp'],e['confidence'],e.get('evidence_id'), 'synthetic-generator'))
-    for e in DATA['evidence']:
-        text=e['preview']; path=EVIDENCE_DIR/f"{e['id']}.txt"; path.write_text(text,encoding='utf-8')
-        digest=hashlib.sha256(path.read_bytes()).hexdigest()
-        c.execute('INSERT INTO evidence(id,source,document_type,created_at,hash,path,extracted_text,entities,audit,case_id,language) VALUES(?,?,?,?,?,?,?,?,?,?,?)',(e['id'],e['source'],e['document_type'],e['created_at'],digest,str(path),text,json.dumps(e.get('entities',[])),json.dumps(e.get('audit',[])),CASE['id'],'English'))
-    for e in DATA['events']:
-        c.execute('INSERT INTO events VALUES(?,?,?,?,?,?,?,?)',(e['id'],e['type'],e['timestamp'],e['title'],json.dumps(e['entities']),e.get('amount'),e['source'],e['confidence']))
+    _seed_missing(c)
     c.commit(); c.close()
 def list_cases():
     """All cases with live entity/evidence/anomaly counts for the Case Management view."""
@@ -87,11 +96,33 @@ def list_cases():
         entity_ids=[entity['id'] for entity in query('SELECT id FROM entities WHERE case_id=?',item['id'])]
         item['relationship_count']=one('SELECT count(*) AS n FROM relationships WHERE source IN ({}) OR target IN ({})'.format(','.join('?'*len(entity_ids)) or "''",','.join('?'*len(entity_ids)) or "''"), *(entity_ids + entity_ids))['n'] if entity_ids else 0
     return cases
-def create_case(name,investigator='',priority='MEDIUM',stage='EVIDENCE_INGESTION',status='ACTIVE',disclaimer=None):
+def case_access(case_id, user_id):
+    item=one('SELECT id,owner_id FROM cases WHERE id=?',case_id)
+    if not item: return None
+    if case_id==CASE['id']: return 'OWNER'
+    if item.get('owner_id')==user_id: return 'OWNER'
+    member=one('SELECT permission FROM case_members WHERE case_id=? AND user_id=?',case_id,user_id)
+    return member['permission'] if member else None
+def claim_orphaned_cases(user_id):
+    c=conn(); rows=c.execute("SELECT id FROM cases WHERE owner_id IS NULL OR owner_id='' ").fetchall()
+    for row in rows:
+        c.execute('UPDATE cases SET owner_id=? WHERE id=?',(user_id,row[0]))
+        c.execute('INSERT OR IGNORE INTO case_members(case_id,user_id,permission,created_at) VALUES(?,?,?,?)',(row[0],user_id,'EDIT',now()))
+    c.commit(); c.close()
+def list_case_members(case_id):
+    return query('SELECT cm.case_id,cm.user_id,cm.permission,cm.created_at,u.email,u.name FROM case_members cm JOIN users u ON u.id=cm.user_id WHERE cm.case_id=? ORDER BY cm.created_at',case_id)
+def add_case_member(case_id,user_id,permission):
+    c=conn(); c.execute('INSERT OR REPLACE INTO case_members(case_id,user_id,permission,created_at) VALUES(?,?,?,?)',(case_id,user_id,permission,now())); c.commit(); c.close()
+    return one('SELECT cm.case_id,cm.user_id,cm.permission,cm.created_at,u.email,u.name FROM case_members cm JOIN users u ON u.id=cm.user_id WHERE cm.case_id=? AND cm.user_id=?',case_id,user_id)
+def remove_case_member(case_id,user_id):
+    c=conn(); result=c.execute('DELETE FROM case_members WHERE case_id=? AND user_id=?',(case_id,user_id)); c.commit(); c.close(); return result.rowcount>0
+def create_case(name,investigator='',priority='MEDIUM',stage='EVIDENCE_INGESTION',status='ACTIVE',disclaimer=None,owner_id=None):
     cid='CASE-'+uuid.uuid4().hex[:8].upper()
     disclaimer=disclaimer or CASE['disclaimer']; timestamp=now()
-    c=conn(); c.execute('INSERT INTO cases(id,name,status,investigator,priority,stage,disclaimer,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)',
-        (cid,name,status,investigator,priority,stage,disclaimer,timestamp,timestamp)); c.commit(); c.close()
+    c=conn(); c.execute('INSERT INTO cases(id,name,status,investigator,priority,stage,disclaimer,created_at,updated_at,owner_id) VALUES(?,?,?,?,?,?,?,?,?,?)',
+        (cid,name,status,investigator,priority,stage,disclaimer,timestamp,timestamp,owner_id)); c.commit(); c.close()
+    if owner_id:
+        c=conn(); c.execute('INSERT OR REPLACE INTO case_members(case_id,user_id,permission,created_at) VALUES(?,?,?,?)',(cid,owner_id,'EDIT',timestamp)); c.commit(); c.close()
     return one('SELECT * FROM cases WHERE id=?',cid)
 def update_case(case_id,**fields):
     existing=one('SELECT * FROM cases WHERE id=?',case_id)
@@ -227,7 +258,7 @@ def next_id(prefix, table):
     ids=query(f"SELECT id FROM {table} WHERE id LIKE ?",prefix+'%')
     highest=max((int(row['id'].rsplit('-',1)[-1]) for row in ids if row['id'].rsplit('-',1)[-1].isdigit()),default=0)
     return f"{prefix}{highest+1:03}"
-def add_upload(filename, raw, text, document_type='Uploaded document', extraction_method='plain text', extracted=None, structured_extraction=None, warnings=None, case_id=CASE['id'], language='English'):
+def add_upload(filename, raw, text, document_type='Uploaded document', extraction_method='plain text', extracted=None, structured_extraction=None, warnings=None, case_id=CASE['id'], language='English', uploader_id=None, metadata=None):
     c=conn()
     try:
         if not one('SELECT id FROM cases WHERE id=?', case_id): raise ValueError('Case not found')
@@ -245,7 +276,7 @@ def add_upload(filename, raw, text, document_type='Uploaded document', extractio
                 eid=next_id(prefix,'entities'); c.execute('INSERT INTO entities VALUES(?,?,?,?,?,?,?)',(eid,label,typ,'[]',.99,case_id,now())); c.commit()
             ids.append(eid); resolutions.append({"mention":label,"entity_id":eid,"confidence":score or .99})
         doc=next_id('DOC-','entities'); c.execute('INSERT INTO entities VALUES(?,?,?,?,?,?,?)',(doc,filename,'Document','[]',1,case_id,now())); c.commit()
-        c.execute('INSERT INTO evidence(id,source,document_type,created_at,hash,path,extracted_text,entities,audit,case_id,language) VALUES(?,?,?,?,?,?,?,?,?,?,?)',(evidence_id,filename,document_type,now(),digest,str(path),text,json.dumps(ids),json.dumps(['uploaded','text extracted','entities resolved',f'language detected: {language}']),case_id,language))
+        c.execute('INSERT INTO evidence(id,source,document_type,created_at,hash,path,extracted_text,entities,audit,case_id,language,uploader_id,metadata) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',(evidence_id,filename,document_type,now(),digest,str(path),text,json.dumps(ids),json.dumps(['uploaded','text extracted','entities resolved',f'language detected: {language}']),case_id,language,uploader_id,json.dumps(metadata or {})))
         rels=0
         for eid in set(ids):
             rid=next_id('R-','relationships'); c.execute('INSERT INTO relationships VALUES(?,?,?,?,?,?,?,?)',(rid,eid,doc,'MENTIONED_IN',now(),.84,evidence_id,'upload extraction')); c.commit(); rels+=1
@@ -255,7 +286,7 @@ def add_upload(filename, raw, text, document_type='Uploaded document', extractio
         result_extraction=dict(structured_extraction or extracted)
         result_extraction.pop('names',None)
         result={"job_id":job_id,"source":filename,"status":"completed","extraction_method":extraction_method,"records_processed":max(1,len(text.splitlines())),"entities_extracted":len(ids),"relationships_created":rels,"events_created":1,"validation_errors":[],"warnings":warnings or [],"extraction":result_extraction,"text_snippet":text[:500],"resolutions":resolutions,"evidence_id":evidence_id,"duration_ms":0}
-        c.execute('INSERT INTO jobs VALUES(?,?,?,?,?,?)',(job_id,filename,'completed',now(),json.dumps(result),case_id)); c.commit(); return result
+        c.execute('INSERT INTO jobs(id,source,status,created_at,result,case_id,uploader_id) VALUES(?,?,?,?,?,?,?)',(job_id,filename,'completed',now(),json.dumps(result),case_id,uploader_id)); c.commit(); return result
     except Exception:
         c.rollback()
         raise
@@ -303,7 +334,10 @@ def _ensure_blackboard_schema():
 def retrieve(question, case_id=CASE['id']):
     # Keep Unicode words intact so retrieval works for every supported script.
     tokens={x.casefold() for x in re.findall(r'[\w-]{2,}',question,flags=re.UNICODE)}
-    evidence=query('SELECT * FROM evidence') if case_id in (None, '', 'ALL_CASES') else query('SELECT * FROM evidence WHERE case_id=?', case_id)
+    if isinstance(case_id,(list,tuple)):
+        placeholders=','.join('?'*len(case_id)) or "''"; evidence=query(f'SELECT * FROM evidence WHERE case_id IN ({placeholders})',*case_id)
+    else:
+        evidence=query('SELECT * FROM evidence') if case_id in (None, '', 'ALL_CASES') else query('SELECT * FROM evidence WHERE case_id=?', case_id)
     scored=[]
     for e in evidence:
         corpus=(e['source']+' '+e['extracted_text']).casefold(); score=sum(t in corpus for t in tokens)

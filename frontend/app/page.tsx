@@ -13,7 +13,8 @@ const NetworkGraph3D = dynamic(() => import('./components/NetworkGraph3D'), {
 const API = process.env.NEXT_PUBLIC_API_URL ?? '';
 const nav = ['Command Center', 'Case Management', 'Intelligence Ingestion', 'Network Explorer', 'Entity Intelligence', 'Anomaly & Risk', 'Investigation Timeline', 'AI Investigation Assistant', 'Evidence & Reports', 'Case Workspace'];
 type Any = any;
-const get = (p: string) => fetch(API + p).then(async (r) => { if (!r.ok) throw new Error(`API ${r.status}: ${await r.text()}`); return r.json(); });
+const authHeaders = (): Record<string, string> => { const token = typeof window === 'undefined' ? '' : localStorage.getItem('shadowintel-token'); return token ? { Authorization: `Bearer ${token}` } : {}; };
+const get = (p: string) => fetch(API + p, { headers: authHeaders() }).then(async (r) => { if (!r.ok) throw new Error(`API ${r.status}: ${await r.text()}`); return r.json(); });
 
 function Badge({ children }: { children: any }) { return <span className="badge">{children}</span>; }
 function Card({ title, children }: { title: string; children: any }) { return <section className="card"><h3>{title}</h3>{children}</section>; }
@@ -48,7 +49,7 @@ function Dashboard({ d, graph, theme, error }: Any) {
   );
 }
 
-function CaseManagement({ onCaseChanged, onUploadCase }: { onCaseChanged?: () => void; onUploadCase?: (caseId: string) => void }) {
+function CaseManagement({ onCaseChanged, onUploadCase, userId }: { onCaseChanged?: () => void; onUploadCase?: (caseId: string) => void; userId?: string }) {
   const emptyForm = { name: '', investigator: '', priority: 'MEDIUM', stage: 'EVIDENCE_INGESTION', status: 'ACTIVE' };
   const [data, setData] = useState<Any>();
   const [error, setError] = useState('');
@@ -57,11 +58,29 @@ function CaseManagement({ onCaseChanged, onUploadCase }: { onCaseChanged?: () =>
   const [form, setForm] = useState<Any>(emptyForm);
   const [editingId, setEditingId] = useState('');
   const [statusFilter, setStatusFilter] = useState('ALL');
+  const [memberCase, setMemberCase] = useState('');
+  const [members, setMembers] = useState<Any[]>([]);
+  const [memberEmail, setMemberEmail] = useState('');
+  const [memberPermission, setMemberPermission] = useState('VIEW');
+  const [memberError, setMemberError] = useState('');
 
   function load() {
     get('/api/cases').then(setData).catch((e) => setError(e instanceof Error ? e.message : 'Failed to load cases.'));
   }
   useEffect(load, []);
+  async function loadMembers(caseId: string) {
+    setMemberError('');
+    try { setMembers(await get(`/api/cases/${caseId}/members`)); setMemberCase(caseId); } catch (reason) { setMemberError(reason instanceof Error ? reason.message : 'Unable to load members.'); }
+  }
+  async function addMember(caseId: string) {
+    try { const response = await fetch(`${API}/api/cases/${caseId}/members`, { method: 'POST', headers: { 'Content-Type': 'application/json', ...authHeaders() }, body: JSON.stringify({ email: memberEmail, permission: memberPermission }) }); const result = await response.json(); if (!response.ok) throw new Error(result.detail || 'Unable to add member.'); setMemberEmail(''); loadMembers(caseId); } catch (reason) { setMemberError(reason instanceof Error ? reason.message : 'Unable to add member.'); }
+  }
+  async function updateMember(caseId: string, memberId: string, permission: string) {
+    try { const response = await fetch(`${API}/api/cases/${caseId}/members/${memberId}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json', ...authHeaders() }, body: JSON.stringify({ email: '', permission }) }); const result = await response.json(); if (!response.ok) throw new Error(result.detail || 'Unable to update member.'); loadMembers(caseId); } catch (reason) { setMemberError(reason instanceof Error ? reason.message : 'Unable to update member.'); }
+  }
+  async function removeMember(caseId: string, memberId: string) {
+    try { const response = await fetch(`${API}/api/cases/${caseId}/members/${memberId}`, { method: 'DELETE', headers: authHeaders() }); const result = await response.json(); if (!response.ok) throw new Error(result.detail || 'Unable to remove member.'); loadMembers(caseId); } catch (reason) { setMemberError(reason instanceof Error ? reason.message : 'Unable to remove member.'); }
+  }
 
   function startEdit(item: Any) {
     setEditingId(item.id);
@@ -79,7 +98,7 @@ function CaseManagement({ onCaseChanged, onUploadCase }: { onCaseChanged?: () =>
     try {
       const url = editingId ? `${API}/api/cases/${editingId}` : `${API}/api/cases`;
       const method = editingId ? 'PATCH' : 'POST';
-      const response = await fetch(url, { method, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(form) });
+      const response = await fetch(url, { method, headers: { 'Content-Type': 'application/json', ...authHeaders() }, body: JSON.stringify(form) });
       const result = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(result.detail || `Case ${editingId ? 'update' : 'creation'} failed (HTTP ${response.status}).`);
       setShowForm(false); setEditingId(''); setForm(emptyForm);
@@ -93,7 +112,7 @@ function CaseManagement({ onCaseChanged, onUploadCase }: { onCaseChanged?: () =>
   async function remove(id: string) {
     if (!window.confirm(`Delete case ${id}? This cannot be undone.`)) return;
     try {
-      const response = await fetch(`${API}/api/cases/${id}`, { method: 'DELETE' });
+      const response = await fetch(`${API}/api/cases/${id}`, { method: 'DELETE', headers: authHeaders() });
       const result = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(result.detail || 'Case could not be deleted.');
       load(); onCaseChanged?.();
@@ -160,8 +179,15 @@ function CaseManagement({ onCaseChanged, onUploadCase }: { onCaseChanged?: () =>
               <Badge>{item.stage.replaceAll('_', ' ')}</Badge>
               <small>{item.entity_count} entities · {item.relationship_count} relationships · {item.evidence_count} evidence</small>
               <button onClick={() => onUploadCase?.(item.id)}>Upload documents</button>
+              {item.owner_id === userId && <button onClick={() => loadMembers(item.id)}>Members</button>}
               <button onClick={() => startEdit(item)}>Edit</button>
               <button onClick={() => remove(item.id)}>Delete</button>
+              {memberCase === item.id && <div className="member-panel">
+                <b>Case members</b>
+                {members.map((member: Any) => <div className="row" key={member.user_id}><span>{member.name} · {member.email}</span><select value={member.permission} onChange={(event) => updateMember(item.id, member.user_id, event.target.value)}><option value="VIEW">View only</option><option value="EDIT">Editable</option></select><button onClick={() => removeMember(item.id, member.user_id)}>Remove</button></div>)}
+                <div className="toolbar"><input value={memberEmail} onChange={(event) => setMemberEmail(event.target.value)} placeholder="Member email" /><select value={memberPermission} onChange={(event) => setMemberPermission(event.target.value)}><option value="VIEW">View only</option><option value="EDIT">Editable</option></select><button disabled={!memberEmail.trim()} onClick={() => addMember(item.id)}>Add member</button></div>
+                {memberError && <p className="notice">{memberError}</p>}
+              </div>}
             </div>
           ))}
           {!cases.length && <p>No cases match this filter.</p>}
@@ -201,7 +227,7 @@ function Ingest({ cases, selectedCaseId, onCaseChange }: { cases: Any[]; selecte
     setBusy(true); setError(''); setStatus('Uploading and processing selected source…'); setResult(undefined);
     setStageState(['active', ...stages.slice(1).map(() => 'pending')]);
     try {
-      const r = await fetch(API + '/api/ingestion/upload', { method: 'POST', body: fd });
+      const r = await fetch(API + '/api/ingestion/upload', { method: 'POST', headers: authHeaders(), body: fd });
       const body = await r.json();
       if (!r.ok) throw new Error(body.detail || 'Ingestion failed');
       await reveal(body);
@@ -270,11 +296,15 @@ function InvestigativeRelationshipMap({ route, entities, selectedEdge, onSelectE
   return <div className="investigative-map" aria-label="Investigative relationship map"><svg viewBox={`0 0 ${width} 260`} role="img" aria-label="Selected relationship path"> <defs><marker id="path-arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path className="path-arrow" d="M 0 0 L 10 5 L 0 10 z" /></marker></defs>{relationships.map((relationship: Any, index: number) => <g className={'path-edge ' + (selectedEdge === index ? 'selected' : '')} key={relationship.id || index} onClick={() => onSelectEdge(index)}><line x1={x(index) + 35} y1="125" x2={x(index + 1) - 35} y2="125" markerEnd="url(#path-arrow)" /><text x={(x(index) + x(index + 1)) / 2} y="104" textAnchor="middle">{relationship.type || 'OBSERVED RELATIONSHIP'}</text></g>)}{ids.map((id, index) => <g className={'path-node ' + (index === 0 ? 'path-from' : index === ids.length - 1 ? 'path-to' : 'path-intermediate')} key={id}><circle cx={x(index)} cy="125" r="35" /><text x={x(index)} y="131" textAnchor="middle">{index === 0 ? 'FROM' : index === ids.length - 1 ? 'TO' : index}</text><text className="path-label" x={x(index)} y="190" textAnchor="middle">{label(id)}</text><text className="path-id" x={x(index)} y="210" textAnchor="middle">{id}</text></g>)}</svg></div>;
 }
 
-function Explorer({ entities, theme }: Any) {
+function Explorer({ entities, theme, selectedCaseId }: Any) {
   const people = entities.filter((x: Any) => x.type === 'Person');
   const [focus, setFocus] = useState(''), [target, setTarget] = useState(''), [graph, setGraph] = useState<Any>(), [path, setPath] = useState<Any>(), [pathIndex, setPathIndex] = useState(0), [selectedEdge, setSelectedEdge] = useState(0);
-  useEffect(() => { if (!focus && people[0]) setFocus(people[0].id); if (!target && people[1]) setTarget(people[1].id); }, [people, focus, target]);
+  useEffect(() => {
+    if (!people.some((person: Any) => person.id === focus)) setFocus(people[0]?.id || '');
+    if (!people.some((person: Any) => person.id === target)) setTarget(people[1]?.id || people[0]?.id || '');
+  }, [people, focus, target]);
   useEffect(() => { if (focus) get('/api/graph/neighborhood?entity_id=' + focus + '&hops=2').then(setGraph); }, [focus]);
+    useEffect(() => { if (focus) get('/api/graph/neighborhood?entity_id=' + encodeURIComponent(focus) + '&hops=2&case_id=' + encodeURIComponent(selectedCaseId)).then(setGraph).catch(() => setGraph(undefined)); }, [focus, selectedCaseId]);
   return (
     <>
       <header><div><p className="eyebrow">KNOWLEDGE GRAPH</p><h1>Network Explorer</h1><p>Live graph records with confidence and provenance — drag to rotate, click a card to focus it.</p></div></header>
@@ -397,7 +427,7 @@ function Assistant({ selectedCaseId, onOpenEvidence }: { selectedCaseId: string;
   function investigate() {
     if (!q.trim() || busy) return;
     setBusy(true); setError(''); setShowWhy(false);
-    fetch(API + '/api/assistant/query', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ question: q, case_id: selectedCaseId }) })
+    fetch(API + '/api/assistant/query', { method: 'POST', headers: { 'Content-Type': 'application/json', ...authHeaders() }, body: JSON.stringify({ question: q, case_id: selectedCaseId }) })
       .then(async (response) => { const result = await response.json(); if (!response.ok) throw new Error(result.detail || 'Investigation failed'); return result; })
       .then((result) => { setA(result); setHistory((items) => [...items, { id: crypto.randomUUID(), question: q, answer: result, language: result.language, created_at: new Date().toISOString() }]); }).catch((reason) => setError(reason instanceof Error ? reason.message : 'Investigation failed')).finally(() => setBusy(false));
   }
@@ -466,7 +496,7 @@ function Evidence({ data, focusId }: Any) {
     setReportBusy(true);
     setReportError('');
     try {
-      const response = await fetch(API + '/api/reports/generate', { method: 'POST' });
+      const response = await fetch(API + '/api/reports/generate', { method: 'POST', headers: authHeaders() });
       const result = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(result.detail || `Report generation failed (HTTP ${response.status}).`);
       setReport(result);
@@ -547,13 +577,13 @@ function CaseWorkspace({ caseId, cases, entities, evidence, user }: Any) {
   const [fromId, setFromId] = useState(''); const [toId, setToId] = useState(''); const [connectionLabel, setConnectionLabel] = useState('');
   const boardRef = useRef<HTMLElement>(null); const drag = useRef<Any>(undefined); const currentCase = cases.find((item: Any) => item.id === caseId); const items = board?.items || [];
   const isImage = (item: Any) => /\.(png|jpe?g|gif|webp|bmp)$/i.test(item?.source || '');
-  function load() { setError(''); get('/api/blackboard?case_id=' + encodeURIComponent(caseId)).then(setBoard).catch((reason) => setError(reason instanceof Error ? reason.message : 'Unable to load this case workspace.')); }
+  function load() { if (caseId === 'ALL_CASES') { setBoard({ items: [], connections: [] }); setError('Select a specific case to open its workspace board.'); return; } setError(''); get('/api/blackboard?case_id=' + encodeURIComponent(caseId)).then(setBoard).catch((reason) => setError(reason instanceof Error ? reason.message : 'Unable to load this case workspace.')); }
   useEffect(load, [caseId]);
   useEffect(() => { setRefId(''); setFromId(''); setToId(''); }, [caseId]);
   useEffect(() => { if (kind === 'ENTITY' && entities[0]) setRefId(entities[0].id); if (kind === 'EVIDENCE' && evidence[0]) setRefId(evidence[0].id); if (kind === 'NOTE' || kind === 'HYPOTHESIS') setRefId(''); }, [kind, entities, evidence]);
-  async function request(path: string, method: string, body?: Any) { const response = await fetch(API + path, { method, headers: body ? { 'Content-Type': 'application/json' } : undefined, body: body ? JSON.stringify(body) : undefined }); const result = await response.json().catch(() => ({})); if (!response.ok) throw new Error(result.detail || `Workspace request failed (HTTP ${response.status}).`); return result; }
-  async function addItem(event: React.FormEvent<HTMLFormElement>) { event.preventDefault(); if (!title.trim() || busy) return; setBusy(true); setError(''); try { const offset = items.length * 24; await request('/api/blackboard/items', 'POST', { case_id: caseId, kind, ref_id: refId || null, title: title.trim(), content: content.trim(), status: kind === 'HYPOTHESIS' ? status : '', x: 36 + (offset % 480), y: 36 + (offset % 300), created_by: user?.name || '' }); setTitle(''); setContent(''); load(); } catch (reason) { setError(reason instanceof Error ? reason.message : 'Unable to add card.'); } finally { setBusy(false); } }
-  async function addConnection() { if (!fromId || !toId || fromId === toId || busy) return; setBusy(true); setError(''); try { await request('/api/blackboard/connections', 'POST', { case_id: caseId, from_id: fromId, to_id: toId, label: connectionLabel.trim() }); setConnectionLabel(''); load(); } catch (reason) { setError(reason instanceof Error ? reason.message : 'Unable to add connection.'); } finally { setBusy(false); } }
+  async function request(path: string, method: string, body?: Any) { const response = await fetch(API + path, { method, headers: body ? { 'Content-Type': 'application/json', ...authHeaders() } : authHeaders(), body: body ? JSON.stringify(body) : undefined }); const result = await response.json().catch(() => ({})); if (!response.ok) throw new Error(result.detail || `Workspace request failed (HTTP ${response.status}).`); return result; }
+  async function addItem(event: React.FormEvent<HTMLFormElement>) { event.preventDefault(); if (caseId === 'ALL_CASES' || !title.trim() || busy) return; setBusy(true); setError(''); try { const offset = items.length * 24; await request('/api/blackboard/items', 'POST', { case_id: caseId, kind, ref_id: refId || null, title: title.trim(), content: content.trim(), status: kind === 'HYPOTHESIS' ? status : '', x: 36 + (offset % 480), y: 36 + (offset % 300), created_by: user?.name || '' }); setTitle(''); setContent(''); load(); } catch (reason) { setError(reason instanceof Error ? reason.message : 'Unable to add card.'); } finally { setBusy(false); } }
+    async function addConnection() { if (caseId === 'ALL_CASES' || !fromId || !toId || fromId === toId || busy) return; setBusy(true); setError(''); try { await request('/api/blackboard/connections', 'POST', { case_id: caseId, from_id: fromId, to_id: toId, label: connectionLabel.trim() }); setConnectionLabel(''); load(); } catch (reason) { setError(reason instanceof Error ? reason.message : 'Unable to connect cards.'); } finally { setBusy(false); } }
   async function updateItem(id: string, patch: Any) { try { const updated = await request('/api/blackboard/items/' + id, 'PATCH', patch); setBoard((value: Any) => ({ ...value, items: value.items.map((item: Any) => item.id === id ? updated : item) })); } catch (reason) { setError(reason instanceof Error ? reason.message : 'Unable to save card.'); } }
   async function removeItem(id: string) { try { await request('/api/blackboard/items/' + id, 'DELETE'); load(); } catch (reason) { setError(reason instanceof Error ? reason.message : 'Unable to remove card.'); } }
   function startDrag(event: React.PointerEvent<HTMLElement>, item: Any) { if ((event.target as HTMLElement).closest('button,select,a')) return; drag.current = { id: item.id, startX: event.clientX, startY: event.clientY, x: item.x, y: item.y }; event.currentTarget.setPointerCapture(event.pointerId); }
@@ -665,9 +695,9 @@ function DashboardApp() {
   });
   const body =
     page === nav[0] ? <Dashboard d={dash} graph={graph} theme={theme} error={error} /> :
-    page === nav[1] ? <CaseManagement onCaseChanged={() => get('/api/cases').then((result) => setCases(result.cases)).catch(() => {})} onUploadCase={(caseId) => { setSelectedCaseId(caseId); setPage(nav[2]); }} /> :
+    page === nav[1] ? <CaseManagement userId={user?.id} onCaseChanged={() => get('/api/cases').then((result) => setCases(result.cases)).catch(() => {})} onUploadCase={(caseId) => { setSelectedCaseId(caseId); setPage(nav[2]); }} /> :
     page === nav[2] ? <Ingest cases={cases} selectedCaseId={selectedCaseId} onCaseChange={setSelectedCaseId} /> :
-    page === nav[3] ? <Explorer entities={entities} theme={theme} /> :
+    page === nav[3] ? <Explorer entities={entities} theme={theme} selectedCaseId={selectedCaseId} /> :
     page === nav[4] ? <EnhancedEntity entities={entities} selectedId={selectedEntityId} /> :
     page === nav[5] ? <HybridAnomalies data={anoms} /> :
     page === nav[6] ? <Timeline data={timeline} entities={entities} anomalies={anoms} /> :

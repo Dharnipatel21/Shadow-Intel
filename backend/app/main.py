@@ -24,9 +24,10 @@ def case_scope(case_id):
 def all_cases_summary():
     return {'id':ALL_CASES,'name':'All Cases','status':'ACTIVE','investigator':'','priority':'','stage':'','disclaimer':'All case records are included in this workspace view.'}
 def case(): return store.one('SELECT * FROM cases LIMIT 1')
-def entity_or_404(id):
+def entity_or_404(id, request: Request|None=None):
     x=store.one('SELECT * FROM entities WHERE id=?',id)
     if not x: raise HTTPException(404,'Entity not found')
+    if request is not None: case_permission(request,x.get('case_id') or data.CASE['id'])
     return store.entity_intelligence([x])[0]
 
 class SignupBody(BaseModel):
@@ -49,21 +50,55 @@ class ChangePasswordBody(BaseModel):
     current_password: str
     new_password: str
 
+def current_user(request: Request, required=True):
+    authz=request.headers.get('authorization','')
+    if not authz.startswith('Bearer '):
+        if not required: return None
+        try: has_users=bool(store.one('SELECT id FROM users LIMIT 1'))
+        except Exception: has_users=False
+        if not has_users: return None
+        raise HTTPException(401,'Missing bearer token.')
+    payload=auth.decode_token(authz.removeprefix('Bearer ')); user=auth.get_user_by_email(payload['email'])
+    if not user: raise HTTPException(401,'User not found.')
+    return user
+def case_permission(request: Request, case_id: str, write=False, owner=False):
+    user=current_user(request, required=False) if case_id==data.CASE['id'] else current_user(request, required=True)
+    if user is None:
+        if case_id==data.CASE['id'] and not write and not owner: return None
+        if case_id==data.CASE['id']: raise HTTPException(401,'Missing bearer token.')
+        return None
+    if case_id==ALL_CASES:
+        if not store.query('SELECT id FROM cases WHERE id=? OR owner_id=? OR id IN (SELECT case_id FROM case_members WHERE user_id=?)',data.CASE['id'],user['id'],user['id']): raise HTTPException(403,'You do not have access to any cases.')
+        if write or owner: raise HTTPException(403,'Select a specific case for write operations.')
+        return user
+    permission=store.case_access(case_id,user['id'])
+    if permission is None:
+        if not store.one('SELECT id FROM users LIMIT 1') and not user: return None
+        raise HTTPException(403,'You do not have access to this case.')
+    if owner and permission!='OWNER': raise HTTPException(403,'Only the case owner can perform this action.')
+    if write and permission not in ('OWNER','EDIT'): raise HTTPException(403,'This case is view-only for your account.')
+    return user
+def accessible_case_ids(request: Request):
+    user=current_user(request,required=False)
+    if user is None: return None
+    return [row['id'] for row in store.query('SELECT id FROM cases WHERE id=? OR owner_id=? OR id IN (SELECT case_id FROM case_members WHERE user_id=?)',data.CASE['id'],user['id'],user['id'])]
+
 @app.post('/api/auth/signup')
 def signup(body: SignupBody):
-    if auth.get_user_by_email(body.email):
+    email=body.email.strip().lower()
+    if auth.get_user_by_email(email):
         raise HTTPException(409, 'An account with this email already exists.')
-    uid, verify_token, otp_code = auth.create_user(body.email, body.password, body.name)
+    uid, verify_token, otp_code = auth.create_user(email, body.password, body.name.strip())
     if config.smtp_enabled():
         try:
-            auth.send_otp_email(body.email, otp_code)
+            auth.send_otp_email(email, otp_code)
         except HTTPException:
             pass
     return {'id': uid, 'email': body.email, 'name': body.name, 'message': 'Account created. Check your email for the verification code.'}
 
 @app.post('/api/auth/login')
 def login(body: LoginBody):
-    user = auth.get_user_by_email(body.email)
+    user = auth.get_user_by_email(body.email.strip().lower())
     if not user or not user['password_hash'] or not auth.verify_password(body.password, user['password_hash']):
         raise HTTPException(401, 'Invalid email or password.')
     if not user['is_verified']:
@@ -155,32 +190,42 @@ class CaseUpdateBody(BaseModel):
     priority: str | None = None
     stage: str | None = None
 
+class CaseMemberBody(BaseModel):
+    email: str
+    permission: str = 'VIEW'
+
 def validate_choice(value, choices, field):
     if value is not None and value not in choices:
         raise HTTPException(422, f"Invalid {field} '{value}'. Must be one of: {', '.join(choices)}.")
 
 @app.get('/api/cases')
-def cases_list():
+def cases_list(request: Request):
     """Case Management: every case with live entity/evidence/relationship counts."""
-    return {'cases': store.list_cases(), 'statuses': data.CASE_STATUSES, 'stages': data.CASE_STAGES, 'priorities': data.CASE_PRIORITIES}
+    user=current_user(request, required=False); cases=store.list_cases()
+    if user: cases=[item for item in cases if item['id']==data.CASE['id'] or store.case_access(item['id'],user['id'])]
+    else: cases=[item for item in cases if item['id']==data.CASE['id']]
+    return {'cases': cases, 'statuses': data.CASE_STATUSES, 'stages': data.CASE_STAGES, 'priorities': data.CASE_PRIORITIES}
 
 @app.post('/api/cases')
-def cases_create(body: CaseCreateBody):
+def cases_create(body: CaseCreateBody, request: Request):
     validate_choice(body.status, data.CASE_STATUSES, 'status')
     validate_choice(body.priority, data.CASE_PRIORITIES, 'priority')
     validate_choice(body.stage, data.CASE_STAGES, 'stage')
     if not body.name.strip():
         raise HTTPException(422, 'Case name is required.')
-    return store.create_case(body.name.strip(), body.investigator.strip(), body.priority, body.stage, body.status)
+    user=current_user(request, required=True)
+    return store.create_case(body.name.strip(), body.investigator.strip(), body.priority, body.stage, body.status, owner_id=user['id'])
 
 @app.get('/api/cases/{case_id}')
-def cases_detail(case_id: str):
+def cases_detail(case_id: str, request: Request):
+    case_permission(request,case_id)
     x = store.one('SELECT * FROM cases WHERE id=?', case_id)
     if not x: raise HTTPException(404, 'Case not found')
     return x
 
 @app.patch('/api/cases/{case_id}')
-def cases_update(case_id: str, body: CaseUpdateBody):
+def cases_update(case_id: str, body: CaseUpdateBody, request: Request):
+    case_permission(request,case_id,write=True)
     validate_choice(body.status, data.CASE_STATUSES, 'status')
     validate_choice(body.priority, data.CASE_PRIORITIES, 'priority')
     validate_choice(body.stage, data.CASE_STAGES, 'stage')
@@ -189,12 +234,39 @@ def cases_update(case_id: str, body: CaseUpdateBody):
     return updated
 
 @app.delete('/api/cases/{case_id}')
-def cases_delete(case_id: str):
+def cases_delete(case_id: str, request: Request):
+    case_permission(request,case_id,owner=True)
     if not store.one('SELECT id FROM cases WHERE id=?', case_id):
         raise HTTPException(404, 'Case not found')
     if not store.delete_case(case_id):
         raise HTTPException(400, 'Cannot delete the last remaining case.')
     return {'deleted': case_id}
+
+@app.get('/api/cases/{case_id}/members')
+def case_members(case_id: str, request: Request):
+    case_permission(request,case_id)
+    return store.list_case_members(case_id)
+
+@app.post('/api/cases/{case_id}/members')
+def case_member_add(case_id: str, body: CaseMemberBody, request: Request):
+    case_permission(request,case_id,owner=True)
+    if body.permission not in ('VIEW','EDIT'): raise HTTPException(422,'Permission must be VIEW or EDIT.')
+    member=auth.get_user_by_email(body.email.strip())
+    if not member: raise HTTPException(404,'User account not found.')
+    return store.add_case_member(case_id,member['id'],body.permission)
+
+@app.patch('/api/cases/{case_id}/members/{user_id}')
+def case_member_update(case_id: str, user_id: str, body: CaseMemberBody, request: Request):
+    case_permission(request,case_id,owner=True)
+    if body.permission not in ('VIEW','EDIT'): raise HTTPException(422,'Permission must be VIEW or EDIT.')
+    if not store.one('SELECT id FROM users WHERE id=?',user_id): raise HTTPException(404,'User account not found.')
+    return store.add_case_member(case_id,user_id,body.permission)
+
+@app.delete('/api/cases/{case_id}/members/{user_id}')
+def case_member_remove(case_id: str, user_id: str, request: Request):
+    case_permission(request,case_id,owner=True)
+    if not store.remove_case_member(case_id,user_id): raise HTTPException(404,'Case member not found.')
+    return {'removed':user_id}
 
 BLACKBOARD_KINDS = ('ENTITY', 'EVIDENCE', 'NOTE', 'HYPOTHESIS')
 BLACKBOARD_STATUSES = ('', 'OPEN', 'SUPPORTED', 'CHALLENGED', 'REJECTED')
@@ -226,14 +298,16 @@ class BlackboardConnectionCreate(BaseModel):
     label: str = ''
 
 @app.get('/api/blackboard')
-def blackboard_get(case_id: str = 'CASE-SL-01'):
+def blackboard_get(request: Request, case_id: str = 'CASE-SL-01'):
     """Live Investigation Blackboard: pinned entities/evidence, notes, hypotheses, and their connections."""
+    case_permission(request,case_id)
     if not store.one('SELECT id FROM cases WHERE id=?', case_id):
         raise HTTPException(404, 'Case not found')
     return store.list_blackboard(case_id)
 
 @app.post('/api/blackboard/items')
-def blackboard_item_create(body: BlackboardItemCreate):
+def blackboard_item_create(body: BlackboardItemCreate, request: Request):
+    case_permission(request,body.case_id,write=True)
     validate_choice(body.kind, BLACKBOARD_KINDS, 'kind')
     if body.status:
         validate_choice(body.status, BLACKBOARD_STATUSES, 'status')
@@ -249,7 +323,10 @@ def blackboard_item_create(body: BlackboardItemCreate):
         raise HTTPException(404, str(error))
 
 @app.patch('/api/blackboard/items/{item_id}')
-def blackboard_item_update(item_id: str, body: BlackboardItemUpdate):
+def blackboard_item_update(item_id: str, body: BlackboardItemUpdate, request: Request):
+    item=store.one('SELECT case_id FROM blackboard_items WHERE id=?',item_id)
+    if not item: raise HTTPException(404,'Blackboard item not found')
+    case_permission(request,item['case_id'],write=True)
     if body.status:
         validate_choice(body.status, BLACKBOARD_STATUSES, 'status')
     updated = store.update_blackboard_item(item_id, title=body.title, content=body.content, status=body.status, x=body.x, y=body.y, color=body.color)
@@ -258,13 +335,17 @@ def blackboard_item_update(item_id: str, body: BlackboardItemUpdate):
     return updated
 
 @app.delete('/api/blackboard/items/{item_id}')
-def blackboard_item_delete(item_id: str):
+def blackboard_item_delete(item_id: str, request: Request):
+    item=store.one('SELECT case_id FROM blackboard_items WHERE id=?',item_id)
+    if not item: raise HTTPException(404,'Blackboard item not found')
+    case_permission(request,item['case_id'],write=True)
     if not store.delete_blackboard_item(item_id):
         raise HTTPException(404, 'Blackboard item not found')
     return {'deleted': item_id}
 
 @app.post('/api/blackboard/connections')
-def blackboard_connection_create(body: BlackboardConnectionCreate):
+def blackboard_connection_create(body: BlackboardConnectionCreate, request: Request):
+    case_permission(request,body.case_id,write=True)
     if body.from_id == body.to_id:
         raise HTTPException(422, 'Cannot connect a card to itself.')
     try:
@@ -273,26 +354,34 @@ def blackboard_connection_create(body: BlackboardConnectionCreate):
         raise HTTPException(404, str(error))
 
 @app.delete('/api/blackboard/connections/{connection_id}')
-def blackboard_connection_delete(connection_id: str):
+def blackboard_connection_delete(connection_id: str, request: Request):
+    connection=store.one('SELECT case_id FROM blackboard_connections WHERE id=?',connection_id)
+    if not connection: raise HTTPException(404,'Connection not found')
+    case_permission(request,connection['case_id'],write=True)
     if not store.delete_blackboard_connection(connection_id):
         raise HTTPException(404, 'Connection not found')
     return {'deleted': connection_id}
 
 @app.get('/api/dashboard')
-def dashboard(case_id:str='CASE-SL-01'):
+def dashboard(request: Request, case_id:str='CASE-SL-01'):
+    case_permission(request,case_id)
     selected=store.one('SELECT * FROM cases WHERE id=?',case_id)
     if not selected: raise HTTPException(404,'Case not found')
     nodes=store.enrich(store.query('SELECT * FROM entities WHERE case_id=?',case_id)); alerts=store.detect_anomalies(); priority=sorted(nodes,key=lambda x:x['priority'],reverse=True)
     return {'case':case(),'kpis':{'entities':len(nodes),'relationships':len(store.query('SELECT id FROM relationships')),'anomalies':len(alerts),'priority':len([x for x in priority if x['priority']>=35]),'evidence':len(store.query('SELECT id FROM evidence'))},'priority':priority[:7],'anomalies':alerts[:5],'activity':store.query('SELECT * FROM events ORDER BY timestamp DESC LIMIT 7')}
 @app.get('/api/dashboard/summary')
-def dashboard_summary(case_id:str='CASE-SL-01'):
+def dashboard_summary(request: Request, case_id:str='CASE-SL-01'):
     """Single source for Command Center widgets, calculated from the live store."""
-    scope=case_scope(case_id); selected=all_cases_summary() if scope is None else store.one('SELECT * FROM cases WHERE id=?',scope)
+    scope=case_scope(case_id)
+    if scope is None: case_permission(request,ALL_CASES)
+    selected=all_cases_summary() if scope is None else store.one('SELECT * FROM cases WHERE id=?',scope)
+    if scope is not None: case_permission(request,scope)
     if not selected: raise HTTPException(404,'Case not found')
-    nodes=store.enrich(store.query('SELECT * FROM entities') if scope is None else store.query('SELECT * FROM entities WHERE case_id=?',scope))
+    allowed=accessible_case_ids(request) if scope is None else None
+    nodes=store.enrich(store.query('SELECT * FROM entities') if allowed is None and scope is None else store.query('SELECT * FROM entities WHERE case_id IN ({})'.format(','.join('?'*len(allowed)) or "''"),*allowed) if scope is None else store.query('SELECT * FROM entities WHERE case_id=?',scope))
     priority=sorted(nodes,key=lambda x:x['priority'],reverse=True)
     alerts=store.detect_anomalies()
-    active_cases=store.query("SELECT id FROM cases WHERE status='ACTIVE'")
+    active_cases=store.query("SELECT id FROM cases WHERE status='ACTIVE'") if allowed is None else store.query("SELECT id FROM cases WHERE status='ACTIVE' AND id IN ({})".format(','.join('?'*len(allowed)) or "''"),*allowed)
     return {
         'case':selected,
         'metrics':{
@@ -307,9 +396,11 @@ def dashboard_summary(case_id:str='CASE-SL-01'):
         'recent_activity':store.query('SELECT * FROM events ORDER BY timestamp DESC LIMIT 7'),
     }
 @app.get('/api/entities')
-def entities(q:str='',case_id:str='CASE-SL-01'):
+def entities(request: Request,q:str='',case_id:str='CASE-SL-01'):
+    if case_scope(case_id) is not None: case_permission(request,case_id)
+    else: case_permission(request,ALL_CASES)
     term=q.strip().casefold()
-    scope=case_scope(case_id); items=store.query('SELECT * FROM entities') if scope is None else store.query('SELECT * FROM entities WHERE case_id=?',scope)
+    scope=case_scope(case_id); allowed=accessible_case_ids(request) if scope is None else None; items=store.query('SELECT * FROM entities') if allowed is None and scope is None else store.query('SELECT * FROM entities WHERE case_id IN ({})'.format(','.join('?'*len(allowed)) or "''"),*allowed) if scope is None else store.query('SELECT * FROM entities WHERE case_id=?',scope)
     if term:
         normalized_term=re.sub(r'[^a-z0-9]','',term)
         items=[item for item in items if any(
@@ -318,19 +409,21 @@ def entities(q:str='',case_id:str='CASE-SL-01'):
         )]
     return store.entity_intelligence(items)
 @app.get('/api/entities/{entity_id}')
-def entity(entity_id:str):
-    x=entity_or_404(entity_id); return {'entity':x,'case':case(),'connections':connections(entity_id),'timeline':entity_timeline(entity_id),'evidence':entity_evidence(entity_id),'anomalies':[a for a in store.detect_anomalies() if entity_id in a['entities']]}
+def entity(entity_id:str, request: Request):
+    x=entity_or_404(entity_id,request); return {'entity':x,'case':case(),'connections':connections(entity_id,request),'timeline':entity_timeline(entity_id,request),'evidence':entity_evidence(entity_id,request),'anomalies':[a for a in store.detect_anomalies() if entity_id in a['entities']]}
 @app.get('/api/entities/{entity_id}/connections')
-def connections(entity_id:str): entity_or_404(entity_id); return store.query('SELECT * FROM relationships WHERE source=? OR target=? ORDER BY timestamp DESC',entity_id,entity_id)
+def connections(entity_id:str, request: Request): entity_or_404(entity_id,request); return store.query('SELECT * FROM relationships WHERE source=? OR target=? ORDER BY timestamp DESC',entity_id,entity_id)
 @app.get('/api/entities/{entity_id}/timeline')
-def entity_timeline(entity_id:str): entity_or_404(entity_id); return [x for x in store.query('SELECT * FROM events ORDER BY timestamp DESC') if entity_id in x['entities']]
+def entity_timeline(entity_id:str, request: Request): entity_or_404(entity_id,request); return [x for x in store.query('SELECT * FROM events ORDER BY timestamp DESC') if entity_id in x['entities']]
 @app.get('/api/entities/{entity_id}/evidence')
-def entity_evidence(entity_id:str): entity_or_404(entity_id); return [x for x in store.query('SELECT * FROM evidence ORDER BY created_at DESC') if entity_id in x['entities']]
+def entity_evidence(entity_id:str, request: Request): entity_or_404(entity_id,request); return [x for x in store.query('SELECT * FROM evidence ORDER BY created_at DESC') if entity_id in x['entities']]
 @app.get('/api/entities/{entity_id}/correlations')
-def entity_correlations(entity_id:str): entity_or_404(entity_id); return store.cross_source_correlations(entity_id)
+def entity_correlations(entity_id:str, request: Request): entity_or_404(entity_id,request); return store.cross_source_correlations(entity_id)
 @app.get('/api/graph')
-def graph(q:str='',focus:str='',hops:int=Query(0,ge=0,le=3),type:str='',case_id:str='CASE-SL-01'):
-    scope=case_scope(case_id); nodes=store.enrich(store.query('SELECT * FROM entities') if scope is None else store.query('SELECT * FROM entities WHERE case_id=?',scope)); node_ids={x['id'] for x in nodes}; edges=[x for x in store.query('SELECT * FROM relationships') if x['source'] in node_ids and x['target'] in node_ids]
+def graph(request: Request,q:str='',focus:str='',hops:int=Query(0,ge=0,le=3),type:str='',case_id:str='CASE-SL-01'):
+    if case_scope(case_id) is not None: case_permission(request,case_id)
+    else: case_permission(request,ALL_CASES)
+    scope=case_scope(case_id); allowed=accessible_case_ids(request) if scope is None else None; nodes=store.enrich(store.query('SELECT * FROM entities') if allowed is None and scope is None else store.query('SELECT * FROM entities WHERE case_id IN ({})'.format(','.join('?'*len(allowed)) or "''"),*allowed) if scope is None else store.query('SELECT * FROM entities WHERE case_id=?',scope)); node_ids={x['id'] for x in nodes}; edges=[x for x in store.query('SELECT * FROM relationships') if x['source'] in node_ids and x['target'] in node_ids]
     import networkx as nx
     g=nx.Graph(); g.add_nodes_from(node_ids); g.add_edges_from((x['source'],x['target']) for x in edges); selected=set(g.nodes)
     if focus:
@@ -340,9 +433,9 @@ def graph(q:str='',focus:str='',hops:int=Query(0,ge=0,le=3),type:str='',case_id:
     if type: selected &= {x['id'] for x in nodes if x['type'].lower()==type.lower()}
     return {'nodes':[x for x in nodes if x['id'] in selected],'edges':[x for x in edges if x['source'] in selected and x['target'] in selected]}
 @app.get('/api/graph/entity/{entity_id}')
-def graph_entity(entity_id:str,hops:int=Query(1,ge=1,le=3)): return graph(focus=entity_id,hops=hops)
+def graph_entity(request: Request, entity_id: str, hops: int = Query(1, ge=1, le=3), case_id: str = 'CASE-SL-01'): return graph(request, focus=entity_id, hops=hops, case_id=case_id)
 @app.get('/api/graph/neighborhood')
-def neighborhood(entity_id:str,hops:int=Query(1,ge=1,le=3)): return graph(focus=entity_id,hops=hops)
+def neighborhood(request: Request, entity_id: str, hops: int = Query(1, ge=1, le=3), case_id: str = 'CASE-SL-01'): return graph(request, focus=entity_id, hops=hops, case_id=case_id)
 @app.get('/api/graph/path')
 @app.get('/api/path')
 def path(source:str,target:str,max_paths:int=Query(5,ge=1,le=10)):
@@ -361,7 +454,13 @@ def path(source:str,target:str,max_paths:int=Query(5,ge=1,le=10)):
     primary=alternatives[0]
     return {'path':primary['path'],'relationships':primary['relationships'],'paths':alternatives,'message':f'Found {len(alternatives)} observed shortest path(s).'}
 @app.get('/api/anomalies')
-def anomalies(case_id:str='CASE-SL-01'): return store.detect_anomalies(case_scope(case_id))
+def anomalies(request: Request,case_id:str='CASE-SL-01'):
+    scope=case_scope(case_id)
+    if scope is not None: case_permission(request,case_id); return store.detect_anomalies(scope)
+    case_permission(request,ALL_CASES)
+    allowed=accessible_case_ids(request)
+    if allowed is None: return store.detect_anomalies()
+    return [alert for case_id in allowed for alert in store.detect_anomalies(case_id)]
 @app.get('/api/anomalies/{anomaly_id}')
 def anomaly(anomaly_id:str):
     x=next((x for x in store.detect_anomalies() if x['id']==anomaly_id),None)
@@ -370,33 +469,39 @@ def anomaly(anomaly_id:str):
 @app.post('/api/anomalies/analyze')
 def analyze(): return {'status':'completed','anomalies':store.detect_anomalies()}
 @app.get('/api/timeline')
-def timeline(entity:str='',kind:str='',start:str='',end:str='',source:str='',case_id:str='CASE-SL-01'):
-    scope=case_scope(case_id)
+def timeline(request: Request,entity:str='',kind:str='',start:str='',end:str='',source:str='',case_id:str='CASE-SL-01'):
+    if case_scope(case_id) is not None: case_permission(request,case_id)
+    else: case_permission(request,ALL_CASES)
+    scope=case_scope(case_id); allowed=accessible_case_ids(request) if scope is None else None
     events=store.query('SELECT events.* FROM events LEFT JOIN evidence ON evidence.id=events.source ORDER BY events.timestamp DESC') if scope is None else store.query('SELECT events.* FROM events LEFT JOIN evidence ON evidence.id=events.source WHERE evidence.case_id=? OR (evidence.id IS NULL AND ?=?) ORDER BY events.timestamp DESC',scope,scope,'CASE-SL-01')
+    if allowed is not None: events=[event for event in events if not event.get('source') or not store.one('SELECT id FROM evidence WHERE id=?',event['source']) or store.one('SELECT case_id FROM evidence WHERE id=?',event['source'])['case_id'] in allowed]
     return [x for x in events if (not entity or entity in x['entities']) and (not kind or x['type'].lower()==kind.lower()) and (not start or x['timestamp']>=start) and (not end or x['timestamp']<=end) and (not source or x['source']==source)]
 @app.get('/api/evidence')
-def evidence(q:str='',case_id:str='CASE-SL-01'):
-    scope=case_scope(case_id); items=store.query('SELECT * FROM evidence ORDER BY created_at DESC') if scope is None else store.query('SELECT * FROM evidence WHERE case_id=? ORDER BY created_at DESC',scope)
+def evidence(request: Request,q:str='',case_id:str='CASE-SL-01'):
+    if case_scope(case_id) is not None: case_permission(request,case_id)
+    else: case_permission(request,ALL_CASES)
+    scope=case_scope(case_id); allowed=accessible_case_ids(request) if scope is None else None; items=store.query('SELECT * FROM evidence ORDER BY created_at DESC') if allowed is None and scope is None else store.query('SELECT * FROM evidence WHERE case_id IN ({}) ORDER BY created_at DESC'.format(','.join('?'*len(allowed)) or "''"),*allowed) if scope is None else store.query('SELECT * FROM evidence WHERE case_id=? ORDER BY created_at DESC',scope)
     return [x for x in items if not q or q.lower() in (x['id']+x['source']+x['extracted_text']).lower()]
 @app.get('/api/evidence/{evidence_id}')
-def evidence_detail(evidence_id:str):
+def evidence_detail(evidence_id:str, request: Request):
     x=store.one('SELECT * FROM evidence WHERE id=?',evidence_id)
     if not x: raise HTTPException(404,'Evidence not found')
+    if request is not None: case_permission(request,x['case_id'])
     return x
 
 @app.get('/api/evidence/{evidence_id}/file')
-def evidence_file(evidence_id: str):
+def evidence_file(evidence_id: str, request: Request):
     """Serve the original locally stored evidence file for supported workspace previews."""
-    item = evidence_detail(evidence_id)
+    item = evidence_detail(evidence_id,request)
     source = Path(item['path'])
     if not source.is_file():
         raise HTTPException(404, 'Stored evidence file not found')
     return FileResponse(source, filename=source.name)
 @app.post('/api/evidence/{evidence_id}/verify')
 @app.get('/api/evidence/{evidence_id}/verify')
-def verify(evidence_id:str):
+def verify(evidence_id:str, request: Request):
     import hashlib
-    x=evidence_detail(evidence_id); p=Path(x['path']); actual=hashlib.sha256(p.read_bytes()).hexdigest() if p.exists() else None
+    x=evidence_detail(evidence_id,request); p=Path(x['path']); actual=hashlib.sha256(p.read_bytes()).hexdigest() if p.exists() else None
     return {'id':evidence_id,'verified':actual==x['hash'],'stored_hash':x['hash'],'actual_hash':actual,'message':'SHA-256 matches the stored evidence record.' if actual==x['hash'] else 'SHA-256 mismatch or source file missing.'}
 def ocr_image(image):
     """Run genuine local Tesseract OCR or clearly state why it cannot run."""
@@ -456,12 +561,13 @@ def youtube_text(url):
     return text,video_id
 @app.post('/api/ingestion/upload')
 @app.post('/api/ingest')
-async def ingest(file:UploadFile|None=File(None), url:str|None=Form(None), case_id:str=Form('CASE-SL-01')):
+async def ingest(request: Request, file:UploadFile|None=File(None), url:str|None=Form(None), case_id:str=Form('CASE-SL-01')):
+    user=case_permission(request,case_id,write=True)
     if not store.one('SELECT id FROM cases WHERE id=?', case_id): raise HTTPException(404, 'Case not found')
     began=perf_counter(); raw=await file.read() if file else b''
     if url:
         if file: raise HTTPException(422,'Provide either a file or a YouTube URL, not both.')
-        text,video_id=youtube_text(url); raw=text.encode('utf-8'); detected_language=language.language_name(language.detect_language(text)); result=store.add_upload(f'youtube_{video_id}.txt',raw,text,'YouTube transcript','transcript',case_id=case_id,language=detected_language)
+        text,video_id=youtube_text(url); raw=text.encode('utf-8'); detected_language=language.language_name(language.detect_language(text)); result=store.add_upload(f'youtube_{video_id}.txt',raw,text,'YouTube transcript','transcript',case_id=case_id,language=detected_language,uploader_id=user['id'] if user else None,metadata={'filename':f'youtube_{video_id}.txt','source':'youtube'})
     else:
         if not file or not raw: raise HTTPException(422,'Provide a non-empty file or a YouTube URL.')
         text,method,detected_language=document_text(file,raw)
@@ -475,12 +581,13 @@ async def ingest(file:UploadFile|None=File(None), url:str|None=Form(None), case_
             except Exception as error:
                 warnings.append(f'LLM extraction unavailable or failed validation; deterministic extraction used: {error}')
                 extraction_method=f'{method} (deterministic fallback)'
-        result=store.add_upload(file.filename or 'upload',raw,text,method,extraction_method,extracted=extracted,structured_extraction=structured,warnings=warnings,case_id=case_id,language=detected_language)
+        result=store.add_upload(file.filename or 'upload',raw,text,method,extraction_method,extracted=extracted,structured_extraction=structured,warnings=warnings,case_id=case_id,language=detected_language,uploader_id=user['id'] if user else None,metadata={'filename':file.filename or 'upload','content_type':file.content_type or 'application/octet-stream','size':len(raw),'extraction_method':extraction_method})
     # Real rule-generated result for the final ingestion pipeline stage.
     result['anomaly_count']=len(store.detect_anomalies())
     result['language']=detected_language; result['duration_ms']=round((perf_counter()-began)*1000,2); return result
 @app.get('/api/ingestion/jobs')
-def jobs(case_id:str='CASE-SL-01'):
+def jobs(request: Request,case_id:str='CASE-SL-01'):
+    case_permission(request,case_id)
     items=store.query('SELECT * FROM jobs WHERE case_id=? ORDER BY created_at DESC',case_id)
     for item in items: item['result']=json.loads(item['result'])
     return items
@@ -489,8 +596,9 @@ def job(job_id:str):
     x=store.one('SELECT * FROM jobs WHERE id=?',job_id)
     if not x: raise HTTPException(404,'Ingestion job not found')
     x['result']=json.loads(x['result']); return x
-def question_entities(question):
-    q=question.lower(); return [x for x in store.enrich(store.query('SELECT * FROM entities')) if x['label'].lower() in q or x['id'].lower() in q]
+def question_entities(question, allowed_case_ids=None):
+    q=question.lower(); items=store.query('SELECT * FROM entities') if allowed_case_ids is None else store.query('SELECT * FROM entities WHERE case_id IN ({})'.format(','.join('?'*len(allowed_case_ids)) or "''"),*allowed_case_ids)
+    return [x for x in store.enrich(items) if x['label'].lower() in q or x['id'].lower() in q]
 def _confidence_score(rel, docs, alerts, matched):
     """Deterministic 0-100 score computed only from what was actually retrieved. Never a probability of guilt."""
     score=min(len(rel),4)*15 + min(len(docs),4)*10 + min(len(alerts),3)*8 + (10 if len(matched)>=2 else 0)
@@ -527,9 +635,10 @@ OBSERVED_COPY={
     'mr': lambda count, relationships: f"{count} पुरावा-आधारित निरीक्षणे मिळाली." if not relationships else f"{relationships} निरीक्षित ग्राफ संबंध ओळखलेल्या घटकांना जोडतात.",
     'gu': lambda count, relationships: f"{count} પુરાવા આધારિત અવલોકનો મળ્યા." if not relationships else f"{relationships} અવલોકિત ગ્રાફ સંબંધો ઓળખાયેલી એન્ટિટીઓને જોડે છે.",
 }
-def answer(question, case_id='CASE-SL-01'):
+def answer(question, case_id='CASE-SL-01', allowed_case_ids=None):
     question_language=language.detect_language(question); response_language=language.language_name(question_language); copy=ASSISTANT_COPY[question_language]; scope=case_scope(case_id)
-    docs=store.retrieve(question, scope); matched=[x for x in question_entities(question) if scope is None or x.get('case_id') == scope]; rel=[]
+    retrieval_scope=allowed_case_ids if scope is None and allowed_case_ids is not None else scope
+    docs=store.retrieve(question, retrieval_scope); matched=[x for x in question_entities(question,allowed_case_ids) if scope is None or x.get('case_id') == scope]; rel=[]
     if len(matched)>=2: rel=path(matched[0]['id'],matched[1]['id'])['relationships']
     alerts=[alert for alert in store.detect_anomalies() if any(entity['id'] in alert.get('entities',[]) for entity in matched)]
     sources=list(dict.fromkeys([d['id'] for d in docs]+[r['evidence_id'] for r in rel if r.get('evidence_id')]+[evidence for alert in alerts for evidence in alert.get('evidence',[])]))
@@ -557,23 +666,30 @@ def answer(question, case_id='CASE-SL-01'):
     return {'provider':provider,'language':response_language,'finding':finding,'observed_evidence':observed,'inference':copy[1] if question_language!='en' else 'The retrieved records may indicate an association for investigator review; they do not establish guilt or legal responsibility.','confidence':confidence,'confidence_score':score,'why':why,'next_step':copy[2] if question_language!='en' else _next_step(rel, docs, alerts, gaps),'evidence_gaps':gaps,'sources':sources,'evidence_ids':sources,'entity_ids':entity_ids}
 @app.post('/api/assistant/query')
 @app.post('/api/assistant')
-def assistant(payload:dict):
+def assistant(payload:dict, request: Request):
     case_id=payload.get('case_id','CASE-SL-01'); question=payload.get('question','').strip()
     if not question: raise HTTPException(422, 'A question is required.')
-    result=answer(question, case_id)
+    case_permission(request,case_id)
+    result=answer(question, case_id, accessible_case_ids(request) if case_scope(case_id) is None else None)
     try: store.add_assistant_message(case_id, question, result, result['language'])
     except ValueError as error: raise HTTPException(404, str(error))
     return result
 @app.get('/api/assistant/history')
-def assistant_history(case_id: str='CASE-SL-01'):
+def assistant_history(request: Request, case_id: str='CASE-SL-01'):
     scope=case_scope(case_id)
-    if scope is None: return store.list_assistant_messages(None)
+    if scope is not None: case_permission(request,scope)
+    if scope is None:
+        case_permission(request,ALL_CASES)
+        allowed=accessible_case_ids(request)
+        items=store.list_assistant_messages(None)
+        return items if allowed is None else [item for item in items if item['case_id'] in allowed]
     if not store.one('SELECT id FROM cases WHERE id=?', scope): raise HTTPException(404, 'Case not found')
     return store.list_assistant_messages(scope)
 @app.post('/api/reports/generate')
 @app.get('/api/report')
-def report():
-    d=dashboard(); all_evidence=store.query('SELECT * FROM evidence ORDER BY created_at DESC'); all_relationships=store.query('SELECT * FROM relationships ORDER BY confidence DESC');
+def report(request: Request):
+    user=current_user(request,required=False)
+    d=dashboard(request); all_evidence=store.query('SELECT * FROM evidence ORDER BY created_at DESC'); all_relationships=store.query('SELECT * FROM relationships ORDER BY confidence DESC');
     integrity=[]
     for item in all_evidence:
         source=Path(item['path']); actual=hashlib.sha256(source.read_bytes()).hexdigest() if source.exists() else None

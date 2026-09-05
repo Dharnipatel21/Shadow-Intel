@@ -69,20 +69,53 @@ def build():
  for i in range(26,40):
   text=f"Synthetic {('CDR' if i<34 else 'transaction')} dataset segment {i-25} for Operation ShadowLink."
   evidence.append({"id":f"E-{i+1:03}","source":f"dataset_{i-25:02}.csv","document_type":"CDR" if i<34 else "Transaction ledger","created_at":stamp(i),"hash":hashlib.sha256(text.encode()).hexdigest(),"integrity":"VERIFIED","preview":text,"entities":[],"audit":["uploaded","processed"]})
+
+ # ---- SCALE-UP: extra entities/activity appended after the original deterministic set. ----
+ # Original IDs (P-017, BA-003, PH-017, L-05, P-036, E-001..E-040 etc.) are untouched, so every
+ # anomaly, test and hardcoded reference above still resolves exactly as before.
+ for i in range(60,150):
+  name=f"{FIRST[i%len(FIRST)]} {LAST[(i*3)%len(LAST)]}"
+  people.append({"id":f"P-{i+1:03}","label":name,"type":"Person","aliases":[name.split()[0].lower()+str(i+1)] if i%11==0 else [],"confidence":round(.80+(i%19)/100,2),"case_id":CASE['id']})
+ for i in range(30,100): phones.append({"id":f"PH-{i+1:03}","label":f"+91 555 {100000+i:06}","type":"Phone","confidence":.98})
+ for i in range(20,100): accounts.append({"id":f"BA-{i+1:03}","label":f"ACCT-{470000+i}","type":"BankAccount","confidence":.98})
+ org_prefixes=["Northstar","Cedar","Atlas","Meridian","Aurora","Vertex","Harborline","Silverline","Bluewave","Ironpeak"]
+ org_suffixes=["Logistics","Trading","Holdings","Freight","Consulting","Imports","Ventures"]
+ for i in range(10,100): orgs.append({"id":f"ORG-{i+1:02}","label":f"{org_prefixes[i%len(org_prefixes)]} {org_suffixes[i%len(org_suffixes)]} {i//len(org_prefixes)}","type":"Organization","confidence":.9})
+ extra_loc_names=["Falcon Yard","Crescent Bridge","Pine Junction","Sable Wharf","Ember Court","Granite Row","Delta Freightway","Marsh Landing","Copper Mill","Ivy Crossing","Union Depot","Cobalt Square","Redwood Dock","Frontier Gate","Wren Terminal","Solstice Yard","Vantage Point","Brookline Wharf","Cinder Row","Hazel Crossing","Beacon Pier","Lantern District","Fennel Market","Timber Yard","Onyx Terminal","Willow Bend","Sterling Docks","Marigold Plaza","Basalt Row","Thistle Landing","Amber Crossing","Nightingale Court","Zephyr Terminal","Coral Bay Depot","Slate Junction"]
+ loc_stems=["Sector","Grid","District","Zone","Block"]
+ while len(extra_loc_names)<85: extra_loc_names.append(f"{loc_stems[len(extra_loc_names)%len(loc_stems)]} {len(extra_loc_names)+1} Yard")
+ for i,x in enumerate(extra_loc_names): locations.append({"id":f"L-{i+16:02}","label":x,"type":"Location","confidence":.93})
+ nodes=people+phones+accounts+orgs+locations  # rebuild with the extras included
+
+ for i in range(30,100): edge(people[i]['id'],phones[i]['id'],"OWNS",2000+i,.97)
+ for i in range(20,100): edge(people[i+5]['id'],accounts[i]['id'],"OWNS",2200+i,.97)
+ for i in range(50,150): edge(people[i]['id'],orgs[i%len(orgs)]['id'],"WORKS_FOR",2500+i,.81)
+ for i in range(470):
+  group=(i//134)*25; a=group+(i*7)%25; b=group+(i*11+3)%25
+  if a==b: b=(b+1)%100
+  pa,pb=phones[a%100]['id'],phones[b%100]['id']
+  edge(pa,pb,"CALLED",3000+i,.77+(i%22)/100)
+  events.append({"id":f"EV-C2-{i:03}","type":"Call","timestamp":stamp(3000+i),"title":"CDR communication record","entities":[pa,pb],"source":f"E-{(i%40)+1:03}","confidence":.87})
+ for i in range(280):
+  a=f"BA-{(i%100)+1:03}"; b=f"BA-{((i*7+5)%100)+1:03}"; amount=RNG.randint(7000,92000)
+  edge(a,b,"TRANSFERRED_TO",4000+i,.8,f"E-{21+(i%20):03}")
+  events.append({"id":f"EV-T2-{i:03}","type":"Transaction","timestamp":stamp(4000+i),"title":f"Transfer of INR {amount:,}","entities":[a,b],"amount":amount,"source":f"E-{21+(i%20):03}","confidence":.9})
+ all_location_ids=[l['id'] for l in locations]
+ for i in range(350):
+  p=people[(i*5)%150]['id']; loc=all_location_ids[(i*3)%len(all_location_ids)]
+  edge(p,loc,"VISITED",5000+i,.78,f"E-{(i%40)+1:03}")
+  events.append({"id":f"EV-L2-{i:03}","type":"Location","timestamp":stamp(5000+i),"title":"Observed location record","entities":[p,loc],"source":f"E-{(i%40)+1:03}","confidence":.79})
+ for i in range(26,100):
+  p=people[(i*3)%150]; phone=phones[i%100]
+  text=f"Field report {i+1}: {p['label']} (alias {p['aliases'][0] if p['aliases'] else p['label'].split()[0]}) was mentioned near {(LOCATIONS+extra_loc_names)[i%(len(LOCATIONS)+len(extra_loc_names))]}. Contact reference {phone['label']}; amount INR {12000+i*725}."
+  eid=f"E-{i+15:03}"; digest=hashlib.sha256(text.encode()).hexdigest()
+  evidence.append({"id":eid,"source":f"report_{i+1:02}.txt","document_type":"Field report","created_at":stamp(900+i),"hash":digest,"integrity":"VERIFIED","preview":text,"entities":[p['id'],phone['id']],"audit":["uploaded","processed","analyzed"]})
+  reports.append({"id":f"DOC-{i+1:03}","text":text,"evidence_id":eid})
+ # ---- end scale-up ----
+
  return {"nodes":nodes,"edges":edges,"events":sorted(events,key=lambda x:x['timestamp'],reverse=True),"evidence":evidence,"reports":reports}
 
 DATA=build()
-
-# A larger seed dataset may be supplied beside the persistent database. Merge it
-# at import time while retaining this module as the compatibility fallback.
-_expanded_seed=__import__('pathlib').Path(__file__).resolve().parents[1] / 'data' / 'data.py'
-if _expanded_seed.is_file():
-    import importlib.util
-    _spec=importlib.util.spec_from_file_location('shadowintel_expanded_seed',_expanded_seed)
-    _module=importlib.util.module_from_spec(_spec)
-    _spec.loader.exec_module(_module)
-    for _name in ('CASE','CASE_STATUSES','CASE_STAGES','CASE_PRIORITIES','DATA'):
-        globals()[_name]=getattr(_module,_name)
 
 def analytics():
  g=nx.Graph(); g.add_nodes_from(n['id'] for n in DATA['nodes']); g.add_edges_from((e['source'],e['target']) for e in DATA['edges'])

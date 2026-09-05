@@ -61,7 +61,7 @@ def decode_token(token: str) -> dict:
 
 
 def get_user_by_email(email: str):
-    return store.one("SELECT * FROM users WHERE email=?", email)
+    return store.one("SELECT * FROM users WHERE lower(email)=lower(?)", email.strip())
 
 
 def generate_otp() -> str:
@@ -86,6 +86,7 @@ def create_user(email: str, password: str | None, name: str, provider: str = "pa
     )
     c.commit()
     c.close()
+    store.claim_orphaned_cases(uid)
     return uid, verify_token, otp_code
 
 
